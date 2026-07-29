@@ -1,0 +1,43 @@
+# A branched tree: one 1-DOF trunk joint feeding two 5-DOF branches.
+#
+# Each TCP's path contains 6 joints, one of which -- `trunk` -- is shared.  With
+# n = 11 and a stacked task space of 12 the two TCPs cannot both be satisfied,
+# so the single stacked damped least-squares solve has to arbitrate the shared
+# column.  Solving the two chains independently would give a different (and
+# wrong) answer; that difference is what this cell is here to catch.
+
+lc_spec_version: "1.0"
+name: branched_trunk
+
+limits: ../limits.yaml
+gains: ../gains.default.yaml
+
+models:
+  - name: torso
+    urdf: ../../assets/urdf/branched_trunk.urdf
+    spheres: ../../assets/spheres/branched_trunk_spheres.json
+    base:
+      xyz: [0.0, 0.0, 0.10]
+      rpy: [0.0, 0.0, 0.0]
+    rest: [0.0, 1.051, 0.9858, -0.0149, -0.4528, 1.2622, 1.051, 0.9858, -0.0149, -0.4528, 1.2622]
+
+tcps:
+  - name: left_tcp
+    model: torso
+    frame: l_tool0
+    effector: { kind: parallel_jaw, width: 1, default: [0.0] }
+    damping: { w_thresh: 0.000137207 }
+
+  - name: right_tcp
+    model: torso
+    frame: r_tool0
+    effector: { kind: parallel_jaw, width: 1, default: [0.0] }
+    damping: { w_thresh: 0.000141213 }
+
+environment:
+  - { name: table, type: plane, point: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0] }
+
+collision:
+  self_pairs: true
+  cross_model: true
+  environment: true

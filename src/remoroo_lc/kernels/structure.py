@@ -1,0 +1,245 @@
+"""Flatten a CellSpec into plain arrays the kernels can consume.
+
+Everything that is a property of the cell rather than of the state is resolved
+here, once, at construction: tree topology, which joints move which links, the
+collision-pair list and its order, environment primitives, limits and gains.  The
+kernels then contain no branching on cell shape at all -- they loop over counts
+that arrive as arguments.
+
+This is also the single place where the reference and kernel paths are made to
+agree on structure.  Both build their pair list through
+`reference.walls.build_pair_list`, so there is no second implementation of the
+ordering rule that could drift from the first.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from remoroo_lc.constants import DTYPE, POINT_DIM, TASK_DIM
+from remoroo_lc.reference.kinematics import KinematicTree
+from remoroo_lc.reference.walls import WallBuilder
+from remoroo_lc.schema import CellSpec
+
+# Environment primitive type codes, shared with the kernels.
+ENV_PLANE = 0
+ENV_BOX = 1
+ENV_SPHERE = 2
+ENV_CYLINDER = 3
+
+_ENV_CODE = {"plane": ENV_PLANE, "box": ENV_BOX, "sphere": ENV_SPHERE, "cylinder": ENV_CYLINDER}
+
+
+@dataclass
+class CellStructure:
+    """Cell-constant data, as flat NumPy arrays ready to upload."""
+
+    cell: CellSpec
+    tree: KinematicTree
+    walls: WallBuilder
+
+    # counts
+    n_joints: int
+    n_links: int
+    n_tcps: int
+    n_spheres: int
+    n_pairs: int
+    n_rows: int
+    n_env: int
+    eff_dim: int
+
+    # topology, per link
+    parent: np.ndarray  # (L,) int32, -1 for a model root
+    qindex: np.ndarray  # (L,) int32, global joint index or -1
+    kind: np.ndarray  # (L,) int32, KIND_*
+    locked: np.ndarray  # (L,) float32, value of a non-actuated joint
+    origin: np.ndarray  # (L, 4, 4) float32, parent link -> joint frame
+    axis: np.ndarray  # (L, 3) float32
+    base: np.ndarray  # (L, 4, 4) float32, world pose of a model root
+    support: np.ndarray  # (L, n) int32, 1 if joint j moves link l
+
+    # frames
+    tcp_link: np.ndarray  # (T,) int32
+    tcp_offset: np.ndarray  # (T, 4, 4) float32
+    tcp_base: np.ndarray  # (T, 4, 4) float32, that TCP's model base transform
+    tcp_base_inv: np.ndarray  # (T, 4, 4) float32
+    w_thresh: np.ndarray  # (T,) float32
+    eff_offset: np.ndarray  # (T,) int32, start of this TCP's effector channels
+    eff_width: np.ndarray  # (T,) int32
+
+    # collision
+    sphere_link: np.ndarray  # (S,) int32
+    sphere_centre: np.ndarray  # (S, 3) float32, link frame
+    sphere_radius: np.ndarray  # (S,) float32
+    pair_kind: np.ndarray  # (P,) int32
+    pair_a: np.ndarray  # (P,) int32
+    pair_b: np.ndarray  # (P,) int32
+    env_type: np.ndarray  # (E,) int32
+    env_pose: np.ndarray  # (E, 4, 4) float32
+    env_dims: np.ndarray  # (E, 3) float32
+
+    # limits
+    q_lo: np.ndarray
+    q_hi: np.ndarray
+    qd_max: np.ndarray
+    q_rest: np.ndarray
+    w_joint: np.ndarray
+    task_v: np.ndarray  # (TASK_DIM,)
+    task_a: np.ndarray
+    task_j: np.ndarray
+    eff_rate: np.ndarray  # (eff_dim,)
+    eff_default: np.ndarray  # (eff_dim,)
+
+    # scalars
+    dt_c: float
+    dt_p: float
+    brake_margin: float
+    accel_lag_ticks: float
+    pos_lag_ticks: float
+    v_clamp_scale: float
+    lambda_min: float
+    lambda_max: float
+    k_post: float
+    w_post: float
+    rho: float
+    iterations: int
+    jl_xi: float
+    jl_safe: float
+    jl_infl: float
+    cd_xi: float
+    cd_safe: float
+    cd_infl: float
+    delta_mode: int  # 0 = cumulative, 1 = per_observation
+
+
+def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStructure:
+    tree = KinematicTree(cell)
+    walls = WallBuilder(cell, tree)
+    lim = cell.limits
+
+    n = cell.n_joints
+    n_links = tree.n_links
+    n_tcps = cell.n_tcps
+    n_spheres = len(walls.spheres)
+    n_pairs = len(walls.pairs)
+
+    support = tree.link_support.astype(np.int32)
+
+    eff_offset, eff_width, off = [], [], 0
+    eff_rate, eff_default = [], []
+    for t in cell.tcps:
+        eff_offset.append(off)
+        eff_width.append(t.effector.width)
+        eff_rate.extend([t.effector.rate_limit] * t.effector.width)
+        eff_default.extend(list(t.effector.default))
+        off += t.effector.width
+
+    env_type = np.asarray([_ENV_CODE[p.ptype] for p in cell.environment], dtype=np.int32)
+    env_pose = (
+        np.stack([p.pose for p in cell.environment]).astype(DTYPE)
+        if cell.environment
+        else np.zeros((0, 4, 4), dtype=DTYPE)
+    )
+    env_dims = np.zeros((len(cell.environment), POINT_DIM), dtype=DTYPE)
+    for e, p in enumerate(cell.environment):
+        env_dims[e, : p.dims.shape[0]] = p.dims
+
+    task = lim["task"]
+    def axis_vec(key: str) -> np.ndarray:
+        return np.asarray(
+            [task["linear"][key]] * POINT_DIM + [task["angular"][key]] * POINT_DIM, dtype=DTYPE
+        )
+
+    from remoroo_lc.reference.interpolator import ChunkInterpolator
+
+    if delta_mode not in ChunkInterpolator.DELTA_MODES:
+        raise ValueError(f"unknown delta_mode {delta_mode!r}")
+
+    return CellStructure(
+        cell=cell,
+        tree=tree,
+        walls=walls,
+        n_joints=n,
+        n_links=n_links,
+        n_tcps=n_tcps,
+        n_spheres=n_spheres,
+        n_pairs=n_pairs,
+        n_rows=walls.n_rows,
+        n_env=len(cell.environment),
+        eff_dim=off,
+        parent=np.asarray(tree._parent, dtype=np.int32),
+        qindex=np.asarray(tree._qidx, dtype=np.int32),
+        kind=np.asarray(tree._kind, dtype=np.int32),
+        locked=np.asarray(tree._locked_value, dtype=DTYPE),
+        origin=tree._origin_arr.astype(DTYPE),
+        axis=tree._axis_arr.astype(DTYPE),
+        base=tree._base_arr.astype(DTYPE),
+        support=support,
+        tcp_link=tree.tcp_link.astype(np.int32),
+        tcp_offset=tree.tcp_offset.astype(DTYPE),
+        tcp_base=np.stack(
+            [next(m for m in cell.models if m.name == t.model).base for t in cell.tcps]
+        ).astype(DTYPE),
+        tcp_base_inv=np.stack(
+            [
+                _inv(next(m for m in cell.models if m.name == t.model).base)
+                for t in cell.tcps
+            ]
+        ).astype(DTYPE),
+        w_thresh=np.asarray([t.w_thresh for t in cell.tcps], dtype=DTYPE),
+        eff_offset=np.asarray(eff_offset, dtype=np.int32),
+        eff_width=np.asarray(eff_width, dtype=np.int32),
+        sphere_link=walls.spheres.link.astype(np.int32),
+        sphere_centre=walls.spheres.centre.astype(DTYPE),
+        sphere_radius=walls.spheres.radius.astype(DTYPE),
+        pair_kind=walls.pairs.kind.astype(np.int32),
+        pair_a=walls.pairs.a.astype(np.int32),
+        pair_b=walls.pairs.b.astype(np.int32),
+        env_type=env_type,
+        env_pose=env_pose,
+        env_dims=env_dims,
+        q_lo=walls.q_lo.astype(DTYPE),
+        q_hi=walls.q_hi.astype(DTYPE),
+        qd_max=cell.joint_velocity_limits().astype(DTYPE),
+        q_rest=cell.rest_posture().astype(DTYPE),
+        w_joint=np.full(n, DTYPE(lim["solver"]["joint_weight"]), dtype=DTYPE),
+        task_v=axis_vec("v_max"),
+        task_a=axis_vec("a_max"),
+        task_j=axis_vec("j_max"),
+        eff_rate=np.asarray(eff_rate, dtype=DTYPE),
+        eff_default=np.asarray(eff_default, dtype=DTYPE),
+        dt_c=1.0 / float(lim["rates"]["command_hz"]),
+        dt_p=1.0 / float(lim["rates"]["policy_hz"]),
+        brake_margin=float(task.get("brake_margin", 0.6)),
+        accel_lag_ticks=float(task.get("accel_lag_ticks", 4.0)),
+        pos_lag_ticks=float(task.get("pos_lag_ticks", 12.0)),
+        v_clamp_scale=float(lim["diffik"].get("v_clamp_scale", 4.0)),
+        lambda_min=float(lim["diffik"]["lambda_min"]),
+        lambda_max=float(lim["diffik"]["lambda_max"]),
+        k_post=float(lim["posture"]["k_post"]),
+        w_post=float(lim["posture"]["weight"]),
+        rho=float(lim["solver"]["rho"]),
+        iterations=int(lim["solver"]["iterations"]),
+        jl_xi=float(lim["joint_limit_damper"]["xi"]),
+        jl_safe=float(np.radians(lim["joint_limit_damper"]["d_safe_deg"])),
+        jl_infl=float(np.radians(lim["joint_limit_damper"]["d_infl_deg"])),
+        cd_xi=float(lim["collision_damper"]["xi"]),
+        cd_safe=float(lim["collision_damper"]["d_safe_m"]),
+        cd_infl=float(lim["collision_damper"]["d_infl_m"]),
+        delta_mode=ChunkInterpolator.DELTA_MODES.index(delta_mode),
+    )
+
+
+def _inv(T: np.ndarray) -> np.ndarray:
+    R = T[:POINT_DIM, :POINT_DIM]
+    p = T[:POINT_DIM, POINT_DIM]
+    out = np.eye(4, dtype=DTYPE)
+    out[:POINT_DIM, :POINT_DIM] = R.T
+    out[:POINT_DIM, POINT_DIM] = -(R.T @ p)
+    return out
+
+
+def stacked_task_dim(structure: CellStructure) -> int:
+    return TASK_DIM * structure.n_tcps

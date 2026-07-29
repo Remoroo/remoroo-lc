@@ -1,0 +1,35 @@
+# A single 6-DOF chain hanging from a fixed body, with NO effector.
+#
+# g = 0 is a first-class case: the action vector is exactly 6 floats, there are
+# no effector channels to rate-limit, and every layer runs unchanged.  This cell
+# exists to keep "legs are also robots" true rather than aspirational.
+
+lc_spec_version: "1.0"
+name: single_6dof_leg
+
+limits: ../limits.yaml
+gains: ../gains.default.yaml
+
+models:
+  - name: limb
+    urdf: ../../assets/urdf/chain6.urdf
+    spheres: ../../assets/spheres/chain6_spheres.json
+    base: # mounted high and inverted: the chain hangs toward the floor
+      xyz: [0.0, 0.0, 0.78]
+      rpy: [3.14159265, 0.0, 0.0]
+    rest: [0.0, -0.431, 2.172, 0.0, -1.6533, 0.0]
+
+tcps:
+  # No `effector:` block at all -> width 0.  The foot is a bare task frame.
+  - name: foot
+    model: limb
+    frame: tool0
+    damping: { w_thresh: 0.000173889 }
+
+environment:
+  - { name: floor, type: plane, point: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0] }
+
+collision:
+  self_pairs: true
+  cross_model: true
+  environment: true

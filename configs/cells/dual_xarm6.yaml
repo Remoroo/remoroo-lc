@@ -1,0 +1,62 @@
+# Reference cell: two 6-DOF chains facing a shared table.
+#
+# This is the shape `remoroo setup` emits for the reference bimanual xArm6 cell.
+# The URDF and sphere files referenced here are PLACEHOLDERS with invented link
+# lengths; the real ones drop into the same paths with no change to this file
+# beyond the paths themselves.  See CELL_SPEC.md.
+
+lc_spec_version: "1.0"
+name: dual_xarm6
+
+limits: ../limits.yaml
+gains: ../gains.default.yaml
+
+models:
+  - name: left
+    urdf: ../../assets/urdf/chain6.urdf
+    spheres: ../../assets/spheres/chain6_spheres.json
+    base:
+      xyz: [0.0, 0.35, 0.08]
+      rpy: [0.0, 0.0, -0.35]
+    rest: [0.0, 0.147, 1.704, 0.0, -0.281, 0.0]
+
+  - name: right
+    urdf: ../../assets/urdf/chain6.urdf
+    spheres: ../../assets/spheres/chain6_spheres.json
+    base:
+      xyz: [0.0, -0.35, 0.08]
+      rpy: [0.0, 0.0, 0.35]
+    rest: [0.0, 0.147, 1.704, 0.0, -0.281, 0.0]
+
+tcps:
+  - name: left_tcp
+    model: left
+    frame: tool0
+    effector:
+      kind: parallel_jaw
+      width: 1
+      default: [0.0]
+    damping: { w_thresh: 0.000178413 }
+
+  - name: right_tcp
+    model: right
+    frame: tool0
+    effector:
+      kind: parallel_jaw
+      width: 1
+      default: [0.0]
+    damping: { w_thresh: 0.000171637 }
+
+environment:
+  - { name: table, type: plane, point: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0] }
+  - name: back_wall
+    type: box
+    xyz: [-0.50, 0.0, 0.75]
+    rpy: [0.0, 0.0, 0.0]
+    dims: [0.06, 2.00, 1.50]
+
+collision:
+  self_pairs: true
+  cross_model: true
+  environment: true
+  ignore_pairs: []

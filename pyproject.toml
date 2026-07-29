@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remoroo-lc"
+version = "0.1.0"
+description = "Remoroo Local Controller (G0): embodiment-agnostic reactive controller for sim/real parity"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Remoroo" }]
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Warp kernels (batched + CUDA).  Apache-2.0.
+kernels = ["warp-lang>=1.5"]
+# PyTorch fallback kernel path (only used if the Warp license gate ever fails).
+kernels-torch = ["torch>=2.2"]
+# Development / oracle / test dependencies.  All permissive (see scripts/license_check.py).
+#
+# NOTE: mink was the intended layer-2 oracle and is itself Apache-2.0, but it
+# hard-requires qpsolvers, which is LGPLv3 -- `import mink` fails without it, so
+# there is no way to use only its permissive parts.  The license gate is a hard
+# constraint for a component that ships inside a commercial product, so the
+# layer-2 oracle is MuJoCo directly (Apache-2.0): mj_jac gives an independent
+# Jacobian at any point on any body, and the damped least-squares solve on top of
+# it is done in float64 NumPy.  That is arguably the better oracle anyway, since
+# MuJoCo shares no conventions or code with this package, whereas mink is a thin
+# wrapper around the same equations.  See SUMMARY.md.
+dev = [
+    "pytest>=8.0",
+    "warp-lang>=1.5",
+    "mujoco>=3.1",       # Apache-2.0, layer-2 oracle (independent kinematics)
+    "proxsuite>=0.6",    # BSD-2-Clause, layer-3 oracle (ProxQP)
+    "ruckig>=0.9",       # MIT, layer-1 oracle
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+remoroo_lc = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: long-running tests (full tape sweeps, 10k-step equivalence)",
+    "oracle: differential tests against third-party oracles (mink / proxsuite / ruckig)",
+    "hw: requires physical hardware; never run in CI",
+    "cuda: requires a CUDA device",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

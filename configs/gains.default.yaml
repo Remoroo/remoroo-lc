@@ -1,0 +1,46 @@
+# Plant / actuator gains.
+#
+# These are PLACEHOLDER values chosen to be stable and unremarkable, not measured
+# ones.  Real values come from scripts/sysid_tapes.py run against the actual
+# hardware (or against the Isaac Lab actuator model), which writes a file of this
+# same shape.  See "placeholder vs production" in the README.
+#
+# The plant integrates, per joint:   M q_ddot = kp (q_target - q) - kd q_dot
+# at plant_rate_hz with semi-implicit Euler, plus a pure command delay.
+
+plant_rate_hz: 1000
+command_delay_ticks: 2 # in command ticks (i.e. at limits.rates.command_hz)
+
+# Defaults by joint kind.  A cell with prismatic joints picks up the prismatic
+# row without anything else in the stack changing.
+#
+# Sized as a critically damped servo at omega_n = 300 rad/s (48 Hz), which is a
+# plausible industrial joint bandwidth and, more to the point, is fast enough
+# that the plant is not the limiting factor at a 250 Hz command rate: it settles
+# a step in ~40 ms and reaches ~99% of the achievable velocity gain.
+#
+#   kp = M omega_n^2,  kd = 2 zeta M omega_n
+#
+# Two ceilings worth knowing about, both of them properties of the setup rather
+# than of these numbers:
+#   * omega_n above ~600 rad/s is unstable at plant_rate_hz = 1000 with
+#     semi-implicit Euler (the stability condition is kd dt / M < 2).  Raise
+#     plant_rate_hz before raising the gains.
+#   * with `q_target = q_measured + q_dot dt_c` and an N-tick command delay, the
+#     achieved joint velocity cannot exceed 1/(1 + N) of the commanded one, no
+#     matter how stiff the servo is -- each command re-anchors on a measurement
+#     that is N ticks stale.  At N = 2 that ceiling is 0.33; these gains reach
+#     0.21.  The task-space feedback loop closes the rest of the gap, at the
+#     cost of a steady-state lag proportional to speed.  See SUMMARY.md.
+by_kind:
+  revolute:
+    inertia: 0.50
+    kp: 45000.0
+    kd: 300.0
+  prismatic:
+    inertia: 2.00
+    kp: 180000.0
+    kd: 1200.0
+
+# Per-joint overrides, keyed "model/joint".  This is what sysid fills in.
+per_joint: {}

@@ -1,0 +1,51 @@
+# Two 7-DOF chains: n = 14 against a stacked task space of 12, so both chains are
+# redundant and the posture term is what makes the null space resolve
+# deterministically.  Same file shape as the reference cell.
+
+lc_spec_version: "1.0"
+name: dual_7dof
+
+limits: ../limits.yaml
+gains: ../gains.default.yaml
+
+models:
+  - name: left
+    urdf: ../../assets/urdf/chain7.urdf
+    spheres: ../../assets/spheres/chain7_spheres.json
+    base:
+      xyz: [0.0, 0.35, 0.08]
+      rpy: [0.0, 0.0, -0.35]
+    rest: [0.0, 0.3061, -0.2383, 1.1736, -2.1465, -0.7386, 0.0]
+
+  - name: right
+    urdf: ../../assets/urdf/chain7.urdf
+    spheres: ../../assets/spheres/chain7_spheres.json
+    base:
+      xyz: [0.0, -0.35, 0.08]
+      rpy: [0.0, 0.0, 0.35]
+    rest: [0.0, 0.3061, -0.2383, 1.1736, -2.1465, -0.7386, 0.0]
+
+tcps:
+  - name: left_tcp
+    model: left
+    frame: tool0
+    effector: { kind: parallel_jaw, width: 1, default: [0.0] }
+    damping: { w_thresh: 0.000975412 }
+
+  - name: right_tcp
+    model: right
+    frame: tool0
+    effector: { kind: parallel_jaw, width: 1, default: [0.0] }
+    damping: { w_thresh: 0.000997223 }
+
+environment:
+  - { name: table, type: plane, point: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0] }
+  - name: back_wall
+    type: box
+    xyz: [-0.50, 0.0, 0.75]
+    dims: [0.06, 2.00, 1.50]
+
+collision:
+  self_pairs: true
+  cross_model: true
+  environment: true

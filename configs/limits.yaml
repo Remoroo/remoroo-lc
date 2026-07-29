@@ -1,0 +1,92 @@
+# Task-space limits, damper parameters, margins and posture gains.
+#
+# These are cell-independent defaults.  A cell file may point at a different
+# limits file, or override individual entries with a `limits_override:` block.
+# Nothing here is per-robot: everything is expressed in task space, in metres,
+# radians and seconds, or as a fraction of a joint's own configured range.
+
+rates:
+  policy_hz: 16 # rate at which action chunks arrive
+  command_hz: 250 # rate at which joint targets are streamed
+
+# Layer 1: chunk interpolator, per-axis clamps in the model base frame.
+task:
+  linear:
+    v_max: 0.5 # m/s
+    a_max: 2.5 # m/s^2
+    j_max: 50.0 # m/s^3
+  angular: # applied per-axis in rotation-vector coordinates
+    v_max: 1.5 # rad/s
+    a_max: 8.0 # rad/s^2
+    j_max: 150.0 # rad/s^3
+  # Fraction of the a/j budget the braking laws plan to use.  1.0 is exactly
+  # time-optimal and hunts around the target in discrete time; 0.6 settles to
+  # micrometres for ~10% more time-to-target.  See AxisLimits.
+  brake_margin: 0.6
+  # Time constants, in command ticks, of the linear laws that take over from the
+  # time-optimal ones near zero error.  Both time-optimal laws have infinite
+  # slope at their origin, which makes the command near the target a function of
+  # float32 rounding; these bound that gain.  See AxisLimits.
+  pos_lag_ticks: 12.0
+  accel_lag_ticks: 4.0
+
+effector:
+  rate_limit: 4.0 # normalised command units per second
+
+# Layer 2: stacked damped least squares.
+diffik:
+  lambda_min: 0.01
+  lambda_max: 0.2
+  # The task velocity handed to the DLS is a SERVO CORRECTION, (p_cmd - p)/dt_c,
+  # not the trajectory's speed.  Clamping it at the trajectory limit conflates the
+  # two: at 250 Hz a 2 mm tracking error already reaches 0.5 m/s, so the
+  # correction saturates almost immediately and the loop stops being proportional.
+  # Measured on the reference cell, that capped achievable TCP speed at ~0.1 m/s
+  # and turned a 0.2 m/s figure-eight into 19 mm of error.  This scales the servo
+  # clamp above the trajectory limit; the trajectory limit is still enforced where
+  # it belongs, in Layer 1, and the output is still bounded by the joint velocity
+  # box and by the walls.
+  v_clamp_scale: 4.0
+  # Fallback when a TCP has no calibrated w_thresh in its cell file.  Real cells
+  # get theirs from scripts/calibrate_wthresh.py, which stores the 5th percentile
+  # of the manipulability measure over uniform random joint samples.
+  w_thresh_default: 0.01
+
+posture:
+  # rad/s per rad of deviation from q_rest.  With w_post = 1e-2 the effective
+  # null-space decay rate is k_post * w_post / (w_joint + w_post), so k_post = 1
+  # gives a ~100 s time constant -- which is not regulation, it only makes the
+  # instantaneous solution unique.  Measured consequence on the redundant cell: a
+  # 30 s figure-eight drifts through a singularity (w -> 0), the damping then
+  # saturates the joint velocity box, and tracking RMS is 53 mm with a 400 mm
+  # excursion.  k_post = 5 holds w above 1.4e-4 and brings RMS to 2.7 mm; past 5
+  # there is nothing further to gain.
+  k_post: 5.0
+  weight: 1.0e-2 # w_post in the layer-3 objective
+
+# Layer 3: constraint rows.
+joint_limit_damper:
+  xi: 1.0
+  d_safe_deg: 2.0
+  d_infl_deg: 10.0
+
+collision_damper:
+  xi: 1.0
+  d_safe_m: 0.015
+  d_infl_m: 0.060
+
+solver:
+  # How the joint velocity box is applied after the sweeps.  "scale" divides the
+  # whole q_dot down to fit, preserving its direction; "clip" bounds each joint
+  # independently, which bends the direction and can convert a commanded retreat
+  # into an approach on a pair the solver had already backed away from.  Measured
+  # on the 7-DOF cell: "clip" interpenetrates two tool spheres by 29 mm on the
+  # drive-into-the-other-chain tape, "scale" does not.  See solver.py.
+  box_mode: scale
+  iterations: 32 # fixed; never data-dependent
+  rho: 1.0e4 # slack penalty
+  joint_weight: 1.0 # diagonal of W
+
+# Optional per-joint velocity limit overrides, keyed "model/joint" or "joint".
+# Empty means "take the limit from the URDF", which is the intended path.
+joint_velocity_override: {}

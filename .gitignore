@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Generated reports.  One sample per cell is committed under reports/sample/.
+reports/*
+!reports/sample/
