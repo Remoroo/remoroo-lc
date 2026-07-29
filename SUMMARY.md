@@ -276,6 +276,21 @@ deployment recipe.** Single-instance, all five cells, 200 ticks:
 | warp cuda, 1 env | 2.98–5.05 ms | 3.85–6.43 ms |
 | reference (NumPy) | 2.07–4.07 ms | 2.22–**11.38** ms |
 
+⚠️ **Measurement conditions were not clean, and this cuts one way.** The rig's
+Orin was under severe pressure while these ran: load average 231 on 12 cores,
+swap 27 of 30 GiB consumed, page cache squeezed to 162 MB, and ~57 GiB of the
+64 GiB unaccounted for by any process RSS (top consumer 0.3 GiB) — a Tegra
+nvmap/GPU-carveout signature. Uptime 2d5h with the rig stack up since boot, so
+this predates and is independent of anything here.
+
+Load can only *inflate* a latency measurement, so the conclusion that matters
+survives: **true CPU p99 on a quiet box is ≤ 0.80 ms**, and the 5× budget margin
+holds a fortiori. What does *not* survive cleanly is the CPU-vs-CUDA ratio — CPU
+and GPU contend differently under this kind of pressure, so "4–6× slower" is
+softer than it reads, even though the structural argument below predicts the sign
+independently. Re-run on a quiet box before treating the absolute CUDA figures as
+load-bearing.
+
 **The edge box runs the CPU backend, not CUDA.** p99 0.80 ms on the worst cell is
 5× inside the 4 ms budget at 250 Hz. CUDA at one environment is 4–6× *slower* than
 CPU and misses the budget on three of five cells — which is not a defect, it is
