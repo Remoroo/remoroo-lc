@@ -307,10 +307,20 @@ reference is the spec" is load-bearing rather than stylistic; and the batched
 numbers remain single-GPU-model — the A10G still stands in for a training fleet
 nobody has run this on.
 
-What is *not* yet measured is the new, narrower version: every determinism number
-was taken on x86-64, and deployment is aarch64. CPU↔CUDA agreement was proven on
-one A10G host; Orin-CPU against x86 has not been compared. The full suite is
-running there now.
+What is *not* yet measured is narrower than "aarch64 is untested", which would be
+wrong — the 507-test suite, determinism tests included, runs on **arm64** every
+time it runs here (Apple M5 Pro). Two architectures are already covered: arm64 on
+macOS, and x86-64 on the A10G, which is where CPU↔CUDA agreement was proven
+because it is the host with both devices.
+
+The real gap is the *platform*, not the instruction set. Apple Silicon and the
+Orin's Cortex-A78AE are both ARMv8, but they do not share a libm or a compiler
+toolchain — and libm is exactly what the determinism contract is exposed to,
+since transcendentals are not IEEE-mandated and `sin`/`cos`/`atan2` may differ in
+the last ulp between implementations. Layer 2 then amplifies a last-ulp
+disagreement by ~1/(σ_min·dt_c). So what needs proving is *Tegra glibc against
+Apple libm*, not ARM against x86. That run was attempted and could not complete;
+see the box-health note above.
 
 **3. That the five-cell matrix spans the space of cells Remoroo will enrol.** It
 covers different DOF counts, redundant and over-constrained cells, shared joints,
