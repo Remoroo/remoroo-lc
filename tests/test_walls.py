@@ -262,7 +262,47 @@ def test_plane_distance_is_signed():
 
 
 def test_environment_rows_exist_for_every_primitive(cell):
+    """Every MOVABLE sphere is checked against every primitive, and the rest are
+    accounted for rather than quietly missing."""
     tree = KinematicTree(cell)
     wb = WallBuilder(cell, tree)
     n_env_rows = int(np.count_nonzero(wb.pairs.kind == PAIR_ROBOT_ENV))
-    assert n_env_rows == len(cell.environment) * len(wb.spheres)
+    assert n_env_rows + wb.pairs.dropped_static_env == len(cell.environment) * len(wb.spheres)
+
+
+def test_dropped_environment_rows_are_exactly_the_ones_with_no_gradient(cell):
+    """The exclusion must be justified by the mechanism, not by a link-name list.
+
+    A sphere on world-fixed mounting hardware has an identically zero point
+    Jacobian, so its environment row can never be satisfied or traded off.  This
+    asserts the two sets coincide: every dropped sphere really has no gradient,
+    and every sphere that has one really was kept.
+    """
+    tree = KinematicTree(cell)
+    wb = WallBuilder(cell, tree)
+    fk = tree.fk(cell.rest_posture())
+    centres = wb.sphere_world(fk)
+    J = tree.point_jacobians(fk, wb.spheres.link, centres)
+    immovable = np.abs(J).max(axis=(1, 2)) == 0.0
+
+    kept = set(np.asarray(wb.pairs.a)[np.asarray(wb.pairs.kind) == PAIR_ROBOT_ENV].tolist())
+
+    # SOUNDNESS, which is the direction that matters for safety: nothing that can
+    # move is ever dropped.
+    for s in range(len(wb.spheres)):
+        if not immovable[s] and len(cell.environment):
+            assert s in kept, f"{wb.spheres.label[s]} can move but has no environment rows"
+
+    # Everything dropped really is immovable.
+    dropped = [s for s in range(len(wb.spheres)) if len(cell.environment) and s not in kept]
+    for s in dropped:
+        assert immovable[s], f"{wb.spheres.label[s]} was dropped but has a gradient"
+    assert wb.pairs.dropped_static_env == len(dropped) * len(cell.environment)
+
+    # NOT completeness, deliberately.  A sphere whose centre lies exactly on its
+    # own joint's axis also has zero gradient, and the structural rule does not
+    # catch it -- `left/link1#0` on the reference cells is one.  Dropping by
+    # measured gradient instead would make the pair list depend on the posture it
+    # was built at, and the fixed row order is what makes the layer reproducible.
+    # A few degenerate rows cost a little work; a state-dependent row list would
+    # cost determinism.

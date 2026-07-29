@@ -53,6 +53,10 @@ class PairList:
     a: np.ndarray  # (P,) sphere index
     b: np.ndarray  # (P,) sphere index, or environment index for PAIR_ROBOT_ENV
     label: list[str] = field(default_factory=list)
+    #: Environment rows dropped because the sphere sits on world-fixed mounting
+    #: hardware.  Reported rather than silently swallowed: it is the difference
+    #: between "nothing to check" and "we forgot to check".
+    dropped_static_env: int = 0
 
     def __len__(self) -> int:
         return int(self.kind.shape[0])
@@ -122,6 +126,32 @@ def _rigid_groups(cell: CellSpec, model_name: str) -> dict[str, int]:
     return {ln: rid[find(ln)] for ln in urdf.links}
 
 
+def _world_rigid_links(cell: CellSpec, model_name: str, groups: dict[str, int]) -> set[str]:
+    """Links no actuated joint can move: the root's own rigid group.
+
+    A model's root is placed by `models[].base` and never moves, so every link
+    welded to it through fixed and locked joints is world-fixed too.  The point
+    Jacobian of a sphere on such a link is identically zero, which makes its
+    distance to an environment primitive a CONSTANT.
+
+    That matters because it is exactly the mounting hardware: the plinth the arm
+    is bolted to, a camera on the overhead beam, a rail the base is clamped to.
+    Those overlap the obstacle they are mounted on BY CONSTRUCTION, and a
+    constraint row for one is degenerate -- `G` is all zeros, so no joint motion
+    changes it, and it can be neither satisfied nor traded off.  It cannot warn
+    anybody either: the geometry is static, so it says the same thing forever.
+    Left in, it reports a permanent collision and every diagnostic that counts
+    active rows reads 100%, hiding the ones that are real.
+    """
+    urdf = cell.urdfs[model_name]
+    children = {j.child for j in urdf.joints}
+    roots = [ln for ln in urdf.links if ln not in children]
+    if not roots:  # a cycle; not a tree, and not this function's problem
+        return set()
+    rg = groups[roots[0]]
+    return {ln for ln in urdf.links if groups[ln] == rg}
+
+
 def _adjacent_groups(cell: CellSpec, model_name: str, groups: dict[str, int]) -> set:
     urdf = cell.urdfs[model_name]
     adj = set()
@@ -171,9 +201,16 @@ def build_pair_list(cell: CellSpec, tree: KinematicTree, spheres: SphereSet) -> 
                 ia.append(i)
                 ib.append(j)
                 label.append(f"{spheres.label[i]} | {spheres.label[j]}")
+    dropped_static = 0
     if cell.collision.get("environment", True):
+        # Mounting hardware gets no environment rows.  See _world_rigid_links:
+        # the sphere cannot move, so the distance is a constant and `G` is zero.
+        static = {m.name: _world_rigid_links(cell, m.name, groups[m.name]) for m in cell.models}
         for e, prim in enumerate(cell.environment):
             for i in range(n_s):
+                if link_of[i] in static[model_of[i]]:
+                    dropped_static += 1
+                    continue
                 kind.append(PAIR_ROBOT_ENV)
                 ia.append(i)
                 ib.append(e)
@@ -192,12 +229,14 @@ def build_pair_list(cell: CellSpec, tree: KinematicTree, spheres: SphereSet) -> 
             np.zeros(0, dtype=np.int32),
             np.zeros(0, dtype=np.int32),
             [],
+            dropped_static,
         )
     return PairList(
         np.asarray(kind, dtype=np.int32),
         np.asarray(ia, dtype=np.int32),
         np.asarray(ib, dtype=np.int32),
         label,
+        dropped_static,
     )
 
 

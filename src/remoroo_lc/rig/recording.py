@@ -207,6 +207,15 @@ def check_kinematics(cell: CellSpec, rec: Recording, stride: int = 10) -> dict:
             if np.linalg.norm(centred) > 1e-12 and np.linalg.norm(r) > 1e-12
             else 0.0
         )
+        # Split the disagreement into the part a replay can live with and the
+        # part it cannot.  A CONSTANT offset is common-mode: every vendor
+        # controller applies its own unit's factory kinematic calibration to the
+        # TCP it reports, our URDF carries nominal geometry, and no amount of
+        # editing the URDF reconciles both units of a pair -- the two arms here
+        # are byte-identical in the URDF and disagree by different amounts.  What
+        # would actually corrupt a comparison is the posture-DEPENDENT remainder,
+        # so that is what gets reported as the residual and gated on.
+        resid = float(np.sqrt(np.mean(np.sum((err[:, u] - bias) ** 2, axis=1))))
         out["tcps"].append(
             {
                 "name": cell.tcps[u].name,
@@ -214,6 +223,7 @@ def check_kinematics(cell: CellSpec, rec: Recording, stride: int = 10) -> dict:
                 "pos_max_mm": float(d.max() * 1e3),
                 "pos_bias_mm": [float(v * 1e3) for v in bias],
                 "pos_bias_norm_mm": float(np.linalg.norm(bias) * 1e3),
+                "pos_residual_rms_mm": resid * 1e3,
                 "rot_rms_deg": float(np.degrees(np.sqrt(np.mean(rot_err[:, u] ** 2)))),
                 "rot_max_deg": float(np.degrees(rot_err[:, u].max())),
                 "error_vs_reach_corr": corr,

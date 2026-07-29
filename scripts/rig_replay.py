@@ -190,18 +190,46 @@ def main() -> int:
             print(
                 f"  {t['name']:<12} pos RMS {t['pos_rms_mm']:6.2f} mm  "
                 f"max {t['pos_max_mm']:6.2f} mm  bias |{t['pos_bias_norm_mm']:5.2f}| mm  "
+                f"residual {t['pos_residual_rms_mm']:5.2f} mm  "
                 f"rot RMS {t['rot_rms_deg']:5.3f} deg  corr(err,reach) "
                 f"{t['error_vs_reach_corr']:+.2f}"
             )
-        worst = max(t["pos_rms_mm"] for t in k["tcps"])
-        if worst > 5.0:
+
+        # Two different questions, and only one of them gates a replay.
+        #
+        # ABSOLUTE agreement -- our FK against the number the vendor controller
+        # reports -- is limited by that unit's factory kinematic calibration,
+        # which lives in the controller and is not in any URDF.  It shows up as a
+        # constant bias, it differs between two physically identical arms, and it
+        # is irreducible without per-unit calibration data.  It only matters for a
+        # stage that consumes controller-reported TCP.
+        #
+        # TRACKING fidelity is what the sim stage measures, and it puts our FK on
+        # BOTH sides of the subtraction, so a constant bias cancels exactly.  What
+        # survives is the posture-dependent residual, so that is the gate.
+        bias_worst = max(t["pos_bias_norm_mm"] for t in k["tcps"])
+        resid_worst = max(t["pos_residual_rms_mm"] for t in k["tcps"])
+        if resid_worst > 2.0:
             print(
-                f"\n  STOP: {worst:.1f} mm of disagreement about where the TCP is.\n"
-                "  A replay would attribute this to the controller.  Fix the URDF,\n"
-                "  the tool transform or the base calibration first -- the bias and\n"
-                "  the reach correlation above say which."
+                f"\n  STOP: {resid_worst:.1f} mm of POSTURE-DEPENDENT disagreement.\n"
+                "  This part does not cancel, so a replay would attribute it to the\n"
+                "  controller.  Fix the URDF, the tool transform or the base\n"
+                "  calibration first -- the reach correlation above says which."
             )
             return 2
+        print(
+            f"  -> {bias_worst:.2f} mm of the disagreement is a CONSTANT bias per TCP:\n"
+            "     each unit's factory calibration, absent from a nominal URDF and\n"
+            "     different for each arm, so not removable here.  It is common-mode\n"
+            f"     and cancels in the replay.  Posture-dependent residual is"
+            f" {resid_worst:.2f} mm."
+        )
+        if a.hw or a.baseline:
+            print(
+                f"     NOTE: absolute accuracy against the controller stays"
+                f" ~{bias_worst:.1f} mm.\n"
+                "     Hardware numbers below are tracking fidelity, not absolute accuracy."
+            )
 
     # ---- stage 2: sim ----------------------------------------------------- #
     if a.sim:
