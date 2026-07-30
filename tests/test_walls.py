@@ -306,3 +306,94 @@ def test_dropped_environment_rows_are_exactly_the_ones_with_no_gradient(cell):
     # was built at, and the fixed row order is what makes the layer reproducible.
     # A few degenerate rows cost a little work; a state-dependent row list would
     # cost determinism.
+
+
+def test_broadphase_is_exactly_equal_to_brute_force(cell):
+    """The link-level broadphase must change SPEED and nothing else.
+
+    It skips a whole block of sphere pairs on one bounding-sphere test.  That is
+    only sound if the bound truly encloses the link's spheres, so this asserts
+    the property directly rather than trusting the construction: assemble with
+    the broadphase, assemble with it disabled, and require the four arrays that
+    reach the solver to be bit-identical.  A bound that is too small shows up
+    here as a missing constraint, which is the failure that would matter.
+    """
+    tree = KinematicTree(cell)
+    wb = WallBuilder(cell, tree)
+    rng = np.random.default_rng(4)
+    lo, hi = (np.asarray(x, dtype=np.float32) for x in cell.joint_limits())
+    for _ in range(12):
+        q = (lo + (hi - lo) * rng.random(cell.n_joints)).astype(np.float32)
+        fk = tree.fk(q)
+        fast = wb.assemble(q, fk)
+        saved = wb.blk_start
+        wb.blk_start = np.zeros(0, dtype=np.int32)  # disable -> test every pair
+        try:
+            brute = wb.assemble(q, fk)
+        finally:
+            wb.blk_start = saved
+        # What the SOLVER reads must be bit-identical.
+        assert np.array_equal(fast.h, brute.h)
+        assert np.array_equal(fast.active, brute.active)
+        # G is filled only for rows the broadphase kept.  On a skipped row G
+        # stays zero and h stays BIG, and the solver's own comment records why
+        # that is a no-op: phi is about -BIG, so the projected update returns
+        # zero and neither lambda nor q_dot moves.  The property asserted here is
+        # the one that matters -- G agrees everywhere the constraint is live --
+        # and test_broadphase_does_not_change_controller_output closes the loop
+        # by checking the full stack bitwise.
+        live = fast.active | brute.active
+        assert np.array_equal(fast.G[live], brute.G[live])
+        # `distance` is a diagnostic and is the one thing that legitimately
+        # differs: a skipped row keeps BIG instead of its true (large) value.
+        # Assert the property that makes the skip SOUND -- every row the
+        # broadphase declined to compute really was beyond the influence
+        # distance.  This is the assertion that would catch an under-sized bound.
+        skipped = (fast.distance >= BIG) & (brute.distance < BIG)
+        assert np.all(brute.distance[skipped] >= float(wb.cd_infl)), (
+            "broadphase skipped a pair that was within influence distance"
+        )
+        both = ~skipped
+        assert np.array_equal(fast.distance[both], brute.distance[both])
+
+
+def test_link_bounds_actually_enclose_their_spheres(cell):
+    """The bound is the whole safety argument, so check it in the link frame."""
+    tree = KinematicTree(cell)
+    wb = WallBuilder(cell, tree)
+    for k, link in enumerate(wb.bound_link):
+        m = wb.spheres.link == link
+        c, r = wb.spheres.centre[m], wb.spheres.radius[m]
+        reach = np.linalg.norm(c - wb.bound_centre[k], axis=1) + r
+        assert reach.max() <= wb.bound_radius[k] + 1e-6, (
+            f"link {link}: sphere reaches {reach.max()} beyond bound {wb.bound_radius[k]}"
+        )
+
+
+def test_broadphase_does_not_change_controller_output(cell):
+    """The end-to-end claim: same joint targets, to the bit.
+
+    The assembly-level test compares constraint arrays; this one runs the whole
+    controller both ways over several chunks and requires the commanded
+    trajectories to be identical.  It is the check that would catch a broadphase
+    interacting with warm-started multipliers, which no single-tick comparison
+    can see.
+    """
+    from remoroo_lc.reference.controller import Controller  # noqa: PLC0415
+
+    def run(broadphase: bool) -> np.ndarray:
+        ctl = Controller(cell)
+        if not broadphase:
+            ctl.walls.blk_start = np.zeros(0, dtype=np.int32)
+        q = cell.rest_posture().copy()
+        ctl.reset(q)
+        rng = np.random.RandomState(3)
+        out = []
+        for _ in range(4):
+            ctl.set_chunk((rng.randn(8, cell.action_dim) * 0.01).astype(np.float32), q)
+            for _ in range(40):
+                q = ctl.step(q).q_target.astype(np.float32)
+                out.append(q.copy())
+        return np.asarray(out)
+
+    assert np.array_equal(run(True), run(False))

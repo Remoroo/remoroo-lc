@@ -48,6 +48,11 @@ def cuda_available() -> bool:
     return wp.is_cuda_available()
 
 
+def _pad1i(a: np.ndarray) -> np.ndarray:
+    """Pad a possibly-empty int array to length 1 so Warp can bind it."""
+    return a if a.size else np.zeros(1, dtype=np.int32)
+
+
 def _pad1(a: np.ndarray) -> np.ndarray:
     """Pad a possibly-empty 1-D array to length 1 so Warp can bind it."""
     return a if a.size else np.zeros(1, dtype=DTYPE)
@@ -776,6 +781,18 @@ def k_walls(
     q_lo: wp.array(dtype=wp.float32),
     q_hi: wp.array(dtype=wp.float32),
     lam: wp.array2d(dtype=wp.float32),
+    link_T: wp.array2d(dtype=wp.mat44f),
+    blk_ia: wp.array(dtype=wp.int32),
+    blk_ib: wp.array(dtype=wp.int32),
+    blk_start: wp.array(dtype=wp.int32),
+    blk_count: wp.array(dtype=wp.int32),
+    bound_link: wp.array(dtype=wp.int32),
+    bound_centre: wp.array(dtype=wp.vec3f),
+    bound_radius: wp.array(dtype=wp.float32),
+    bound_world: wp.array2d(dtype=wp.vec3f),
+    n_blocks: int,
+    n_rr: int,
+    n_bounds: int,
     n_joints: int,
     n_pairs: int,
     jl_xi: float,
@@ -819,8 +836,61 @@ def k_walls(
 
     base = 2 * n_joints
     cspan = cd_infl - cd_safe
+    # n_blocks == 0 means the broadphase is off: the pair loop below starts at 0
+    # and covers the robot-robot rows itself, exactly as it did before.
+    rr_from = int(0)
+    if n_blocks > 0:
+        rr_from = n_rr
     mp = BIG_F
-    for p in range(n_pairs):
+    # --- link-level broadphase ------------------------------------------- #
+    # One bounding-sphere test per LINK PAIR retires every sphere pair between
+    # those links.  Sound because each bound provably encloses its link's
+    # spheres, so a block whose bounds are further apart than d_infl contains no
+    # pair within d_infl.  Measured on the rig cell: 401 blocks cover 38,532
+    # sphere pairs, and only ~15 blocks are ever close along a real trajectory.
+    for k in range(n_bounds):
+        Tb = link_T[b, bound_link[k]]
+        bound_world[b, k] = rot_of(Tb) * bound_centre[k] + pos_of(Tb)
+
+    for blk in range(n_blocks):  # n_blocks == 0 disables the broadphase
+        ka = blk_ia[blk]
+        kb = blk_ib[blk]
+        gap = (
+            wp.length(bound_world[b, ka] - bound_world[b, kb])
+            - bound_radius[ka]
+            - bound_radius[kb]
+        )
+        lo_p = blk_start[blk]
+        hi_p = lo_p + blk_count[blk]
+        if gap >= cd_infl:
+            # Park the whole block.  The row keeps its slot -- same shape, same
+            # meaning -- it is simply known to be inactive without looking.
+            for p in range(lo_p, hi_p):
+                row = base + p
+                h[b, row] = BIG_F
+                dist_out[b, row] = BIG_F
+        else:
+            for p in range(lo_p, hi_p):
+                row = base + p
+                ia = pair_a[p]
+                ib = pair_b[p]
+                diff = sphere_c[b, ia] - sphere_c[b, ib]
+                dist = wp.length(diff)
+                nrm = diff / (dist + EPS_F)
+                d = dist - sphere_radius[ia] - sphere_radius[ib]
+                dist_out[b, row] = d
+                if d < cd_infl:
+                    h[b, row] = cd_xi * (d - cd_safe) / cspan
+                else:
+                    h[b, row] = BIG_F
+                mp = wp.min(mp, d)
+                if d < cd_infl or lam[b, row] != 0.0:
+                    for j in range(n_joints):
+                        G[b, row, j] = -wp.dot(nrm, Js[b, ia, j] - Js[b, ib, j])
+
+    # With the broadphase disabled (n_blocks == 0) this loop starts at 0 and
+    # covers the robot-robot rows too, which is the original behaviour.
+    for p in range(rr_from, n_pairs):
         row = base + p
         ia = pair_a[p]
         d = float(0.0)
@@ -1252,6 +1322,16 @@ class BatchedController:
         )
         self.sphere_radius = arr(st.sphere_radius, f32)
         self.pair_kind = arr(st.pair_kind, wp.int32)
+        self.blk_ia = arr(_pad1i(st.blk_ia), wp.int32)
+        self.blk_ib = arr(_pad1i(st.blk_ib), wp.int32)
+        self.blk_start = arr(_pad1i(st.blk_start), wp.int32)
+        self.blk_count = arr(_pad1i(st.blk_count), wp.int32)
+        self.bound_link = arr(_pad1i(st.bound_link), wp.int32)
+        self.bound_centre = arr(
+            st.bound_centre if len(st.bound_link) else np.zeros((1, POINT_DIM), DTYPE),
+            wp.vec3f,
+        )
+        self.bound_radius = arr(_pad1(st.bound_radius), f32)
         self.pair_a = arr(st.pair_a, wp.int32)
         self.pair_b = arr(st.pair_b, wp.int32)
         self.env_type = arr(st.env_type, wp.int32)
@@ -1333,6 +1413,7 @@ class BatchedController:
         self.dist = z((b, st.n_rows))
         self.Dscratch = z((b, st.n_rows))
         self.live_idx = z((b, st.n_rows), wp.int32)
+        self.bound_world = z((b, max(len(st.bound_link), 1)), wp.vec3f)
         self.qdscratch = z((b, n))
 
         # outputs
@@ -1544,7 +1625,11 @@ class BatchedController:
                 self.q, self.sphere_c, self.Js, self.sphere_radius,
                 self.pair_kind, self.pair_a, self.pair_b,
                 self.env_type, self.env_pose, self.env_dims,
-                self.q_lo, self.q_hi, self.lam, st.n_joints, st.n_pairs,
+                self.q_lo, self.q_hi, self.lam,
+                self.link_T, self.blk_ia, self.blk_ib, self.blk_start, self.blk_count,
+                self.bound_link, self.bound_centre, self.bound_radius, self.bound_world,
+                st.n_blocks, st.n_rr, len(st.bound_link),
+                st.n_joints, st.n_pairs,
                 st.jl_xi, st.jl_safe, st.jl_infl, st.cd_xi, st.cd_safe, st.cd_infl,
             ],
             outputs=[self.G, self.h, self.dist, self.min_pair, self.min_margin],

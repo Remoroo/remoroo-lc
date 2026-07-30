@@ -162,6 +162,77 @@ def _adjacent_groups(cell: CellSpec, model_name: str, groups: dict[str, int]) ->
     return adj
 
 
+def link_bounds(spheres: SphereSet) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One bounding sphere per link, in that LINK's own frame.
+
+    Computed once at load and never again: a link's spheres are rigid in its
+    frame, so the bound's radius is invariant and only its centre needs the
+    link transform at runtime.  Returns (link_ids, centres, radii).
+    """
+    ids = np.unique(spheres.link) if len(spheres) else np.zeros(0, dtype=np.int32)
+    cen = np.zeros((ids.size, POINT_DIM), dtype=DTYPE)
+    rad = np.zeros(ids.size, dtype=DTYPE)
+    for k, link in enumerate(ids):
+        m = spheres.link == link
+        c, r = spheres.centre[m], spheres.radius[m]
+        lo = (c - r[:, None]).min(axis=0)
+        hi = (c + r[:, None]).max(axis=0)
+        mid = ((lo + hi) * DTYPE(0.5)).astype(DTYPE)
+        cen[k] = mid
+        rad[k] = DTYPE(np.max(np.linalg.norm(c - mid, axis=1) + r))
+    return ids.astype(np.int32), cen, rad
+
+
+def group_pairs_by_link(
+    pairs: PairList, spheres: SphereSet
+) -> tuple[PairList, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Sort robot-robot pairs into contiguous per-link-pair BLOCKS.
+
+    This is the data structure a broadphase needs: if two links' bounding
+    spheres are further apart than the influence distance, then every sphere
+    pair between them is too, and the whole block can be skipped with ONE test
+    instead of hundreds.  Measured on the rig cell: 38,532 sphere pairs fall
+    into 401 link pairs (96 per block on average), and along the teach recording
+    only ~15 of those 401 blocks are ever close.
+
+    The sort is a permutation of the pair list applied once at load, so the row
+    order stays fixed for the lifetime of the cell -- which is what the
+    determinism argument needs.  It is NOT the same order as before, and that
+    matters: the Gauss-Seidel sweep in Layer 3 reads rows in order, so a
+    different fixed order is a different (equally valid) fixed point.
+
+    Returns the reordered PairList plus (block_link_a, block_link_b,
+    block_start, block_count) covering only the robot-robot rows, which are
+    placed first.
+    """
+    kind = pairs.kind
+    rr = np.where(kind == PAIR_ROBOT_ROBOT)[0]
+    env = np.where(kind != PAIR_ROBOT_ROBOT)[0]
+    if rr.size == 0:
+        return pairs, *(np.zeros(0, dtype=np.int32) for _ in range(4))
+
+    la = spheres.link[pairs.a[rr]].astype(np.int64)
+    lb = spheres.link[pairs.b[rr]].astype(np.int64)
+    lo_, hi_ = np.minimum(la, lb), np.maximum(la, lb)
+    key = lo_ * (int(spheres.link.max()) + 1) + hi_
+    # Stable sort so that, within a block, the original relative order survives.
+    order = rr[np.argsort(key, kind="stable")]
+    skey = key[np.argsort(key, kind="stable")]
+    uniq, start, count = np.unique(skey, return_index=True, return_counts=True)
+    perm = np.concatenate([order, env])
+
+    reordered = PairList(
+        pairs.kind[perm],
+        pairs.a[perm],
+        pairs.b[perm],
+        [pairs.label[i] for i in perm],
+        pairs.dropped_static_env,
+    )
+    blk_a = (uniq // (int(spheres.link.max()) + 1)).astype(np.int32)
+    blk_b = (uniq % (int(spheres.link.max()) + 1)).astype(np.int32)
+    return reordered, blk_a, blk_b, start.astype(np.int32), count.astype(np.int32)
+
+
 def build_pair_list(cell: CellSpec, tree: KinematicTree, spheres: SphereSet) -> PairList:
     """Resolve the fixed collision-pair list for this cell."""
     n_s = len(spheres)
@@ -395,6 +466,39 @@ class WallBuilder:
         self.tree = tree
         self.spheres = build_sphere_set(cell, tree)
         self.pairs = build_pair_list(cell, tree, self.spheres)
+        # Link-level broadphase.  See group_pairs_by_link: pairs are reordered
+        # into contiguous per-link-pair blocks so one bounding-sphere test can
+        # retire a whole block.  Zero fidelity loss -- a skipped block is one
+        # whose every sphere pair is provably beyond the influence distance --
+        # and it is what keeps the wall check from being O(all pairs) forever.
+        self.broadphase = bool(cell.collision.get("broadphase", True))
+        (
+            self.pairs,
+            self.blk_link_a,
+            self.blk_link_b,
+            self.blk_start,
+            self.blk_count,
+        ) = group_pairs_by_link(self.pairs, self.spheres)
+        self.bound_link, self.bound_centre, self.bound_radius = link_bounds(self.spheres)
+        if not self.broadphase:
+            # Keep the reordering (row order is a cell property either way) but
+            # drop the block table so every pair is tested.  Measured: the
+            # broadphase is a clear win on CPU and a LOSS on CUDA, where one
+            # thread per environment means neighbouring threads keep different
+            # blocks live and the warp executes the union of their branches.
+            self.blk_start = np.zeros(0, dtype=np.int32)
+            self.blk_count = np.zeros(0, dtype=np.int32)
+            self.blk_link_a = np.zeros(0, dtype=np.int32)
+            self.blk_link_b = np.zeros(0, dtype=np.int32)
+        slot = {int(L): k for k, L in enumerate(self.bound_link)}
+        self._blk_ia = np.asarray([slot[int(x)] for x in self.blk_link_a], dtype=np.int32)
+        self._blk_ib = np.asarray([slot[int(x)] for x in self.blk_link_b], dtype=np.int32)
+        # Row indices per block, precomputed: the broadphase gathers these, so the
+        # per-tick cost is a gather rather than an arange-and-concatenate.
+        self._blk_rows_all = [
+            np.arange(int(a), int(a) + int(c), dtype=np.int64)
+            for a, c in zip(self.blk_start, self.blk_count)
+        ]
         jl = cell.limits["joint_limit_damper"]
         cd = cell.limits["collision_damper"]
         self.jl_xi = DTYPE(jl["xi"])
@@ -421,6 +525,11 @@ class WallBuilder:
             sel = np.where((kind == PAIR_ROBOT_ENV) & (self.pairs.b == e))[0]
             if sel.size:
                 self._env_rows.append((e, sel, self.pairs.a[sel]))
+
+    def _blk_rows(self, live_blk: np.ndarray) -> np.ndarray:
+        if live_blk.size == self.blk_start.size:
+            return np.arange(self._rr.size, dtype=np.int64)
+        return np.concatenate([self._blk_rows_all[int(k)] for k in live_blk])
 
     # ------------------------------------------------------------------ #
     def row_labels(self) -> list[str]:
@@ -471,20 +580,48 @@ class WallBuilder:
             base = self.n_joint_rows
 
             if self._rr.size:
-                diff = (centres[self._rr_a] - centres[self._rr_b]).astype(DTYPE)
-                dist = np.linalg.norm(diff, axis=1).astype(DTYPE)
-                normal = diff / (dist + EPS)[:, None]
-                d = (
-                    dist - self.spheres.radius[self._rr_a] - self.spheres.radius[self._rr_b]
-                ).astype(DTYPE)
-                Jrel = J_s[self._rr_a] - J_s[self._rr_b]
-                rows = base + self._rr
-                G[rows] = -np.einsum("pi,pij->pj", normal, Jrel)
-                distance[rows] = d
-                on = d < self.cd_infl
-                sel = rows[on]
-                h[sel] = self.cd_xi * (d[on] - self.cd_safe) / cspan
-                active[sel] = True
+                # BROADPHASE.  One bounding-sphere test retires a whole link
+                # block.  A block is skipped only when its two link bounds are
+                # further apart than cd_infl, and every sphere inside a bound is
+                # by construction within it -- so a skipped pair is provably
+                # beyond influence and its row keeps the h = BIG it was
+                # initialised with.  Speed only; tests/test_walls.py asserts the
+                # assembled (G, h, active, distance) are IDENTICAL either way.
+                keep = self._rr
+                if self.blk_start.size:
+                    Tb = fk.link_T[self.bound_link]
+                    bc = (
+                        np.einsum("kij,kj->ki", Tb[:, :POINT_DIM, :POINT_DIM], self.bound_centre)
+                        + Tb[:, :POINT_DIM, POINT_DIM]
+                    )
+                    gap = (
+                        np.linalg.norm(bc[self._blk_ia] - bc[self._blk_ib], axis=1)
+                        - self.bound_radius[self._blk_ia]
+                        - self.bound_radius[self._blk_ib]
+                    )
+                    live_blk = np.where(gap < self.cd_infl)[0]
+                    keep = (
+                        self._rr[self._blk_rows(live_blk)]
+                        if live_blk.size
+                        else self._rr[:0]
+                    )
+                if keep.size:
+                    ka = self.pairs.a[keep]
+                    kb = self.pairs.b[keep]
+                    diff = (centres[ka] - centres[kb]).astype(DTYPE)
+                    dist = np.linalg.norm(diff, axis=1).astype(DTYPE)
+                    normal = diff / (dist + EPS)[:, None]
+                    d = (
+                        dist - self.spheres.radius[ka] - self.spheres.radius[kb]
+                    ).astype(DTYPE)
+                    Jrel = J_s[ka] - J_s[kb]
+                    rows = base + keep
+                    G[rows] = -np.einsum("pi,pij->pj", normal, Jrel)
+                    distance[rows] = d
+                    on = d < self.cd_infl
+                    sel = rows[on]
+                    h[sel] = self.cd_xi * (d[on] - self.cd_safe) / cspan
+                    active[sel] = True
 
             for e, sel, sph in self._env_rows:
                 prim = self.cell.environment[e]

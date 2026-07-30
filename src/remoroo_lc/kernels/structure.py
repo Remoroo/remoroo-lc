@@ -73,6 +73,18 @@ class CellStructure:
     sphere_link: np.ndarray  # (S,) int32
     sphere_centre: np.ndarray  # (S, 3) float32, link frame
     sphere_radius: np.ndarray  # (S,) float32
+    # Link-level broadphase tables (see reference.walls.group_pairs_by_link).
+    # Robot-robot rows come FIRST and are grouped into contiguous blocks, one per
+    # link pair, so one bounding-sphere test can retire a whole block.
+    blk_ia: np.ndarray  # (B,) index into bound_* for the block's first link
+    blk_ib: np.ndarray  # (B,)
+    blk_start: np.ndarray  # (B,) first pair index of the block
+    blk_count: np.ndarray  # (B,)
+    bound_link: np.ndarray  # (L,) global link id
+    bound_centre: np.ndarray  # (L, 3) in the link frame
+    bound_radius: np.ndarray  # (L,)
+    n_blocks: int
+    n_rr: int  # robot-robot pairs; env pairs occupy [n_rr, n_pairs)
     pair_kind: np.ndarray  # (P,) int32
     pair_a: np.ndarray  # (P,) int32
     pair_b: np.ndarray  # (P,) int32
@@ -197,6 +209,15 @@ def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStruc
         sphere_link=walls.spheres.link.astype(np.int32),
         sphere_centre=walls.spheres.centre.astype(DTYPE),
         sphere_radius=walls.spheres.radius.astype(DTYPE),
+        blk_ia=walls._blk_ia.astype(np.int32),
+        blk_ib=walls._blk_ib.astype(np.int32),
+        blk_start=walls.blk_start.astype(np.int32),
+        blk_count=walls.blk_count.astype(np.int32),
+        bound_link=walls.bound_link.astype(np.int32),
+        bound_centre=walls.bound_centre.astype(DTYPE),
+        bound_radius=walls.bound_radius.astype(DTYPE),
+        n_blocks=int(walls.blk_start.size),
+        n_rr=int(np.count_nonzero(walls.pairs.kind == 0)),
         pair_kind=walls.pairs.kind.astype(np.int32),
         pair_a=walls.pairs.a.astype(np.int32),
         pair_b=walls.pairs.b.astype(np.int32),
