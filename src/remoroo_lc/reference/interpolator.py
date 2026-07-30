@@ -186,6 +186,7 @@ class ChunkInterpolator:
         self.cell = cell
         self.delta_mode = delta_mode
         self.mode = str(cell.limits["task"].get("mode", "point_to_point"))
+        self.lead_ticks = float(cell.limits["task"].get("lead_ticks", 0.0))
         if self.mode not in self.TRACK_MODES:
             raise ValueError(f"task.mode must be one of {self.TRACK_MODES}")
         self.lim = AxisLimits.from_limits(cell.limits)
@@ -414,16 +415,39 @@ class ChunkInterpolator:
         ).astype(DTYPE)
         return x, v, a
 
-    def step(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def step(self, clock_scale: float = 1.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Advance one command tick.
+
+        `clock_scale` < 1 advances the chunk clock more slowly than real time.
+        That is a PATH-CONSISTENT slowdown: the geometry of the commanded path is
+        untouched and only its schedule stretches.  It exists because the
+        alternative, when the kinematics cannot deliver the commanded speed, is to
+        fall behind and let the feedback term fight -- and that loop was measured
+        demanding 8.8 m/s on a 1 m/s path.  Slowing the clock keeps the error
+        small, which keeps the request feasible, which keeps the arm ON the path.
+        Trading timing for geometry is the right way round for a follower: a
+        policy re-anchors on measured state every chunk anyway, so late is
+        recoverable and off-path is not.
 
         Returns (p_base (T, 3), R_base (T, 3, 3), effector command).
         """
         x_tgt, eff_tgt = self._chunk_target()
         if self.mode == "follower":
             if self.waypoints.shape[0]:
-                # The command sent this tick is the pose at the END of the tick.
-                x_f, v_f, a_f = self._follower_state(float(self.t_chunk) + float(self.dt_c))
+                # The command is the pose at the end of the tick, plus
+                # `lead_ticks` of LEAD.  The lead exists because the loop is
+                # discrete in a specific way: the pose commanded for t+dt is
+                # realised by a joint velocity integrated across [t, t+dt], so
+                # the achieved pose trails the commanded one by about one tick of
+                # travel however good the feedforward is.  A proportional loop
+                # then holds a steady-state offset of v/kp on a ramp -- measured
+                # as 10.8 mm of purely TANGENTIAL (timing) error at 1 m/s with
+                # kp = 100, which is exactly v/kp.  One tick of lead cancels the
+                # discretisation term at source instead of raising kp, which is
+                # what saturated the joint box.
+                x_f, v_f, a_f = self._follower_state(
+                    float(self.t_chunk) + float(self.dt_c) * (1.0 + self.lead_ticks)
+                )
                 self.x[:] = x_f
                 self.v[:] = v_f
                 self.a[:] = a_f
@@ -439,7 +463,7 @@ class ChunkInterpolator:
             step = self.eff_rate * self.dt_c
             delta = np.clip(eff_tgt - self.eff, -step, step)
             self.eff = np.clip(self.eff + delta, DTYPE(0.0), DTYPE(1.0)).astype(DTYPE)
-        self.t_chunk = DTYPE(self.t_chunk + self.dt_c)
+        self.t_chunk = DTYPE(self.t_chunk + self.dt_c * DTYPE(clock_scale))
 
         p = self.x[:, :POINT_DIM].copy()
         R = np.zeros((self.n_tcps, POINT_DIM, POINT_DIM), dtype=DTYPE)

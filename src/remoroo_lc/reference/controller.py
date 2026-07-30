@@ -63,6 +63,7 @@ class Controller:
             raise ValueError("solver.mode must be 'qp' or 'metric'")
         self.dyn = MetricDynamics(cell) if self.solve_mode == "metric" else None
         self.anti_windup = bool(cell.limits["diffik"].get("anti_windup", False))
+        self.clock_governor = bool(cell.limits["diffik"].get("clock_governor", False))
 
         sol = cell.limits["solver"]
         self.iterations = int(sol["iterations"])
@@ -84,6 +85,7 @@ class Controller:
 
         self._lam = np.zeros(self.walls.n_rows, dtype=DTYPE)
         self._windup = 1.0
+        self._clock = 1.0
         self.tick = 0
 
     # ------------------------------------------------------------------ #
@@ -124,6 +126,7 @@ class Controller:
         self.interp.reset(p_b, R_b)
         self._lam = np.zeros(self.walls.n_rows, dtype=DTYPE)
         self._windup = 1.0
+        self._clock = 1.0
         if self.dyn is not None:
             self.dyn.reset()
         self.tick = 0
@@ -142,7 +145,7 @@ class Controller:
         J = self.tree.tcp_jacobians(fk)
         w = self.tree.manipulability(J)
 
-        p_cb, R_cb, eff = self.interp.step()
+        p_cb, R_cb, eff = self.interp.step(self._clock)
         p_cw, R_cw = self._to_world(p_cb, R_cb)
 
         # Feedforward: Layer 1's own command velocity, rotated base -> world.
@@ -202,6 +205,9 @@ class Controller:
         # on the teach recording it went 17.9 -> 19.0 mm RMS at kp 50.  Kept
         # because it is the right shape for a cell whose limits bind harder.
         self._windup = ik.governor if self.anti_windup else 1.0
+        # Clock governor: the next tick's reference advances at the rate the
+        # kinematics can actually deliver.  See ChunkInterpolator.step.
+        self._clock = ik.governor if self.clock_governor else 1.0
         qd_post = posture_velocity(q, self.q_rest, self.k_post)
 
         sol = solve_qp(
@@ -241,6 +247,7 @@ class Controller:
             "task_velocity": v_task.copy(),
             "qd_des": ik.qd_des.copy(),
             "governor": ik.governor,
+            "clock": self._clock,
         }
         return StepOutput(
             q_target=q_target,
