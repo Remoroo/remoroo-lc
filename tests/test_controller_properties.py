@@ -281,13 +281,19 @@ def test_branched_conflict_is_bounded_and_deterministic():
     # Regression lock: this exact compromise is the behaviour under test.  If it
     # changes, either the arbitration changed or something upstream of it did,
     # and either way that is a decision, not a detail.
+    #
+    # Re-locked when Layer 2 gained a feedforward velocity term, a configurable
+    # feedback gain, and the feasibility governor (see DiffIk).  Those change the
+    # request the arbitration is arbitrating, so the compromise moves -- by about
+    # 2e-2 rad here.  The invariants above are the actual contract and they all
+    # still hold: finite, inside the velocity limit, bitwise repeatable.
     np.testing.assert_allclose(
         q_a,
         np.array(
             [
-                0.25909373, 1.4282929, 0.26799116, 1.1618012, -0.27512884,
-                0.10483745, 0.9346017, 1.2062315, 0.45409423, -0.6052772,
-                0.8705812,
+                0.256456, 1.422825, 0.278254, 1.14287, -0.27545,
+                0.124039, 0.935575, 1.204219, 0.45007, -0.603478,
+                0.873708,
             ],
             dtype=np.float32,
         ),

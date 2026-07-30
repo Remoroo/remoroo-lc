@@ -62,6 +62,7 @@ class Controller:
         if self.solve_mode not in ("qp", "metric"):
             raise ValueError("solver.mode must be 'qp' or 'metric'")
         self.dyn = MetricDynamics(cell) if self.solve_mode == "metric" else None
+        self.anti_windup = bool(cell.limits["diffik"].get("anti_windup", False))
 
         sol = cell.limits["solver"]
         self.iterations = int(sol["iterations"])
@@ -82,6 +83,7 @@ class Controller:
         self.T_base_inv = np.stack([transform_inv(T) for T in self.T_base]).astype(DTYPE)
 
         self._lam = np.zeros(self.walls.n_rows, dtype=DTYPE)
+        self._windup = 1.0
         self.tick = 0
 
     # ------------------------------------------------------------------ #
@@ -121,6 +123,7 @@ class Controller:
         p_b, R_b = self.tcp_pose_base(np.asarray(q, dtype=DTYPE))
         self.interp.reset(p_b, R_b)
         self._lam = np.zeros(self.walls.n_rows, dtype=DTYPE)
+        self._windup = 1.0
         if self.dyn is not None:
             self.dyn.reset()
         self.tick = 0
@@ -142,7 +145,20 @@ class Controller:
         p_cb, R_cb, eff = self.interp.step()
         p_cw, R_cw = self._to_world(p_cb, R_cb)
 
-        v_task = self.diffik.task_velocity(p_w, R_w, p_cw, R_cw)
+        # Feedforward: Layer 1's own command velocity, rotated base -> world.
+        # The rotation part is the rate of the command's rotation VECTOR, used
+        # directly as an angular velocity.  That is exact at r = 0 and accurate
+        # to O(|r|^2) elsewhere, and the command state is deliberately anchored
+        # near its reference orientation (see ChunkInterpolator.R_ref) precisely
+        # so |r| stays small.
+        v_ff = np.zeros((self.cell.n_tcps, TASK_DIM), dtype=DTYPE)
+        v_base = self.interp.command_velocity
+        for i in range(self.cell.n_tcps):
+            Rb = self.T_base[i][:POINT_DIM, :POINT_DIM]
+            v_ff[i, :POINT_DIM] = Rb @ v_base[i, :POINT_DIM]
+            v_ff[i, POINT_DIM:] = Rb @ v_base[i, POINT_DIM:]
+
+        v_task = self.diffik.task_velocity(p_w, R_w, p_cw, R_cw, v_ff, self._windup)
         walls = self.walls.assemble(q, fk)
 
         if self.solve_mode == "metric":
@@ -180,7 +196,12 @@ class Controller:
                 p_cmd=p_cw, R_cmd=R_cw, p_meas=p_w, R_meas=R_w, diag=diag,
             )
 
-        ik = self.diffik.solve(J, w, v_task)
+        ik = self.diffik.solve(J, w, v_task, self.qd_max)
+        # Anti-windup is OPT-IN because it measured worse: scaling the feedback
+        # by the governor costs authority on exactly the ticks that need it, and
+        # on the teach recording it went 17.9 -> 19.0 mm RMS at kp 50.  Kept
+        # because it is the right shape for a cell whose limits bind harder.
+        self._windup = ik.governor if self.anti_windup else 1.0
         qd_post = posture_velocity(q, self.q_rest, self.k_post)
 
         sol = solve_qp(
@@ -219,6 +240,7 @@ class Controller:
             "damping": ik.lam.copy(),
             "task_velocity": v_task.copy(),
             "qd_des": ik.qd_des.copy(),
+            "governor": ik.governor,
         }
         return StepOutput(
             q_target=q_target,

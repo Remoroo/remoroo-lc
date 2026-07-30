@@ -489,11 +489,16 @@ def k_diffik(
     Jv: wp.array3d(dtype=wp.vec3f),
     Jw: wp.array3d(dtype=wp.vec3f),
     w_thresh: wp.array(dtype=wp.float32),
+    v_cmd: wp.array3d(dtype=wp.float32),
+    tcp_base: wp.array(dtype=wp.mat44f),
+    qd_max: wp.array(dtype=wp.float32),
     n_joints: int,
     n_tcps: int,
     dt_c: float,
     v_max_lin: float,
     v_max_ang: float,
+    kp_lin: float,
+    kp_ang: float,
     lambda_min: float,
     lambda_max: float,
     A: wp.array3d(dtype=wp.float32),
@@ -511,8 +516,15 @@ def k_diffik(
 
     # --- task velocity, norm clamped per TCP --------------------------------- #
     for i in range(n_tcps):
-        lin = (p_cmd[b, i] - tcp_p[b, i]) * inv_dt
-        ang = log_so3(R_cmd[b, i] * wp.transpose(tcp_R[b, i])) * inv_dt
+        # Feedforward (Layer 1's own command velocity, base -> world) plus a
+        # feedback term at a servo bandwidth.  See DiffIk.task_velocity.
+        lin = (p_cmd[b, i] - tcp_p[b, i]) * kp_lin
+        ang = log_so3(R_cmd[b, i] * wp.transpose(tcp_R[b, i])) * kp_ang
+        Rb = rot_of(tcp_base[i])
+        lin = lin + Rb * wp.vec3f(v_cmd[b, i, 0], v_cmd[b, i, 1], v_cmd[b, i, 2])
+        ang = ang + Rb * wp.vec3f(
+            v_cmd[b, i, PDIM + 0], v_cmd[b, i, PDIM + 1], v_cmd[b, i, PDIM + 2]
+        )
         nl = wp.length(lin)
         na = wp.length(ang)
         if nl > v_max_lin:
@@ -594,6 +606,20 @@ def k_diffik(
         for r in range(m6):
             acc += Jf[b, r, j] * yvec[b, r]
         qd_des[b, j] = acc
+
+    # Feasibility governor: uniform, direction-preserving.  See DiffIk.solve --
+    # the damped inverse can ask for 100x what the arm can do near a singular
+    # direction, and letting that reach Layer 3 makes its box annihilate the
+    # tracking component along with the excess.
+    worst = float(0.0)
+    for j in range(n_joints):
+        frac = wp.abs(qd_des[b, j]) / wp.max(qd_max[j], EPS_F)
+        if frac > worst:
+            worst = frac
+    if worst > 1.0:
+        g = 1.0 / worst
+        for j in range(n_joints):
+            qd_des[b, j] = qd_des[b, j] * g
 
 
 @wp.func
@@ -1365,9 +1391,11 @@ class BatchedController:
             dim=self.num_envs,
             inputs=[
                 self.tcp_p, self.tcp_R, self.p_cmd, self.R_cmd, self.Jv, self.Jw,
-                self.w_thresh, st.n_joints, st.n_tcps, st.dt_c,
+                self.w_thresh, self.v, self.tcp_base, self.qd_max,
+                st.n_joints, st.n_tcps, st.dt_c,
                 float(st.task_v[0]) * st.v_clamp_scale,
                 float(st.task_v[POINT_DIM]) * st.v_clamp_scale,
+                st.kp_lin, st.kp_ang,
                 st.lambda_min, st.lambda_max,
             ],
             outputs=[

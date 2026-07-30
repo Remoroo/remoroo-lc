@@ -99,6 +99,8 @@ class CellStructure:
     accel_lag_ticks: float
     pos_lag_ticks: float
     v_clamp_scale: float
+    kp_lin: float
+    kp_ang: float
     lambda_min: float
     lambda_max: float
     k_post: float
@@ -217,6 +219,8 @@ def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStruc
         accel_lag_ticks=float(task.get("accel_lag_ticks", 4.0)),
         pos_lag_ticks=float(task.get("pos_lag_ticks", 12.0)),
         v_clamp_scale=float(lim["diffik"].get("v_clamp_scale", 4.0)),
+        kp_lin=float(lim["diffik"].get("kp_linear", float(lim["rates"]["command_hz"]))),
+        kp_ang=float(lim["diffik"].get("kp_angular", float(lim["rates"]["command_hz"]))),
         lambda_min=float(lim["diffik"]["lambda_min"]),
         lambda_max=float(lim["diffik"]["lambda_max"]),
         k_post=float(lim["posture"]["k_post"]),
