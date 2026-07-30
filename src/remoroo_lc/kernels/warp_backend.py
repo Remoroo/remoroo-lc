@@ -1098,8 +1098,9 @@ def k_set_chunk(
                             )
 
 
-@wp.kernel
-def k_reset(
+@wp.func
+def reset_row(
+    b: int,
     tcp_p: wp.array2d(dtype=wp.vec3f),
     tcp_R: wp.array2d(dtype=wp.mat33f),
     tcp_base_inv: wp.array(dtype=wp.mat44f),
@@ -1117,7 +1118,8 @@ def k_reset(
     t_chunk: wp.array(dtype=wp.float32),
     n_way: wp.array(dtype=wp.int32),
 ):
-    b = wp.tid()
+    """All of one row's controller state.  Shared by k_reset and k_reset_rows so
+    "reset everything" and "reset these rows" cannot drift apart."""
     for i in range(n_tcps):
         Ti = tcp_base_inv[i]
         p_base = rot_of(Ti) * tcp_p[b, i] + pos_of(Ti)
@@ -1139,6 +1141,59 @@ def k_reset(
         lam[b, k] = 0.0
     t_chunk[b] = 0.0
     n_way[b] = 0
+
+
+@wp.kernel
+def k_reset(
+    tcp_p: wp.array2d(dtype=wp.vec3f),
+    tcp_R: wp.array2d(dtype=wp.mat33f),
+    tcp_base_inv: wp.array(dtype=wp.mat44f),
+    eff_default: wp.array(dtype=wp.float32),
+    n_tcps: int,
+    eff_dim: int,
+    x: wp.array3d(dtype=wp.float32),
+    v: wp.array3d(dtype=wp.float32),
+    a: wp.array3d(dtype=wp.float32),
+    eff: wp.array2d(dtype=wp.float32),
+    R_ref: wp.array2d(dtype=wp.mat33f),
+    anchor: wp.array3d(dtype=wp.float32),
+    eff_anchor: wp.array2d(dtype=wp.float32),
+    lam: wp.array2d(dtype=wp.float32),
+    t_chunk: wp.array(dtype=wp.float32),
+    n_way: wp.array(dtype=wp.int32),
+):
+    b = wp.tid()
+    reset_row(
+        b, tcp_p, tcp_R, tcp_base_inv, eff_default, n_tcps, eff_dim,
+        x, v, a, eff, R_ref, anchor, eff_anchor, lam, t_chunk, n_way,
+    )
+
+
+@wp.kernel
+def k_reset_rows(
+    rows: wp.array(dtype=wp.int32),
+    tcp_p: wp.array2d(dtype=wp.vec3f),
+    tcp_R: wp.array2d(dtype=wp.mat33f),
+    tcp_base_inv: wp.array(dtype=wp.mat44f),
+    eff_default: wp.array(dtype=wp.float32),
+    n_tcps: int,
+    eff_dim: int,
+    x: wp.array3d(dtype=wp.float32),
+    v: wp.array3d(dtype=wp.float32),
+    a: wp.array3d(dtype=wp.float32),
+    eff: wp.array2d(dtype=wp.float32),
+    R_ref: wp.array2d(dtype=wp.mat33f),
+    anchor: wp.array3d(dtype=wp.float32),
+    eff_anchor: wp.array2d(dtype=wp.float32),
+    lam: wp.array2d(dtype=wp.float32),
+    t_chunk: wp.array(dtype=wp.float32),
+    n_way: wp.array(dtype=wp.int32),
+):
+    """One thread per SELECTED row.  Rows not listed are untouched."""
+    reset_row(
+        rows[wp.tid()], tcp_p, tcp_R, tcp_base_inv, eff_default, n_tcps, eff_dim,
+        x, v, a, eff, R_ref, anchor, eff_anchor, lam, t_chunk, n_way,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1231,8 +1286,11 @@ class BatchedController:
         def z(shape, dtype=f32):
             return wp.zeros(shape, dtype=dtype, device=device)
 
-        # per-environment state
-        self.q = z((b, n))
+        # per-environment state.  `q` is REBOUND per call by _upload_q -- to the
+        # caller's device array when they pass one, or to this owned buffer for the
+        # numpy path.  Keeping the owned one separate is what makes zero-copy safe.
+        self._q_owned = z((b, n))
+        self.q = self._q_owned
         self.x = z((b, t, TASK_DIM))
         self.v = z((b, t, TASK_DIM))
         self.a = z((b, t, TASK_DIM))
@@ -1288,11 +1346,40 @@ class BatchedController:
         self.min_margin = z(b)
 
     # ------------------------------------------------------------------ #
-    def _upload_q(self, q: np.ndarray) -> None:
+    def _upload_q(self, q) -> None:
+        """Bind the measured joint state, without a host round trip when possible.
+
+        A `wp.array` (or anything exposing `__cuda_array_interface__`, which
+        covers torch CUDA tensors) is used IN PLACE: in a training loop `q` is
+        already physics state on the device, and copying it to the host and back
+        every control tick is pure loss.  Numpy is still accepted for the
+        single-instance deployment path, where there is no device to stay on.
+        """
+        if isinstance(q, wp.array):
+            if q.shape != (self.num_envs, self.st.n_joints):
+                raise ValueError(
+                    f"q has shape {q.shape}, expected "
+                    f"({self.num_envs}, {self.st.n_joints})"
+                )
+            self.q = q
+            return
+        if hasattr(q, "__cuda_array_interface__") or hasattr(q, "__array_interface__"):
+            try:
+                self.q = wp.from_torch(q) if hasattr(q, "__cuda_array_interface__") else None
+            except Exception:  # noqa: BLE001 -- not a torch tensor; fall through to numpy
+                self.q = None
+            if self.q is not None:
+                if self.q.shape != (self.num_envs, self.st.n_joints):
+                    raise ValueError(
+                        f"q has shape {self.q.shape}, expected "
+                        f"({self.num_envs}, {self.st.n_joints})"
+                    )
+                return
         q = np.ascontiguousarray(np.asarray(q, dtype=DTYPE).reshape(self.num_envs, -1))
         if q.shape[1] != self.st.n_joints:
             raise ValueError(f"q has {q.shape[1]} joints, expected {self.st.n_joints}")
-        self.q.assign(q)
+        self._q_owned.assign(q)
+        self.q = self._q_owned
 
     def _fk(self) -> None:
         st = self.st
@@ -1318,9 +1405,44 @@ class BatchedController:
             device=self.device,
         )
 
-    def reset(self, q: np.ndarray) -> None:
+    def reset(self, q, rows=None) -> None:
+        """Re-initialise controller state, for every row or a subset of them.
+
+        `rows` is a device index array (or anything wp.array accepts) selecting
+        which batch rows to re-initialise; None means all of them, which is the
+        historical behaviour and the only one a single-instance deployment needs.
+
+        The subset form exists because the rows of a batched controller are
+        supposed to be INDEPENDENT instances, and every piece of per-row state
+        here is stale the moment that row's robot is moved somewhere else: R_ref
+        is a reference orientation captured from a pose that no longer exists,
+        (x, v, a) carry velocity from a motion that ended, the chunk anchor
+        points at an old measurement, and `lam` warm-starts the QP from duals
+        belonging to a different collision configuration.  Resetting all rows to
+        fix one is not a workaround -- it destroys the other rows' state too.
+        """
         self._upload_q(q)
         self._fk()
+        if rows is not None:
+            idx = rows if isinstance(rows, wp.array) else wp.array(
+                np.ascontiguousarray(np.asarray(rows, dtype=np.int32)).reshape(-1),
+                dtype=wp.int32,
+                device=self.device,
+            )
+            wp.launch(
+                k_reset_rows,
+                dim=int(idx.shape[0]),
+                inputs=[
+                    idx, self.tcp_p, self.tcp_R, self.tcp_base_inv, self.eff_default,
+                    self.st.n_tcps, self.st.eff_dim,
+                ],
+                outputs=[
+                    self.x, self.v, self.a, self.eff, self.R_ref, self.anchor,
+                    self.eff_anchor, self.lam, self.t_chunk, self.n_way,
+                ],
+                device=self.device,
+            )
+            return
         wp.launch(
             k_reset,
             dim=self.num_envs,
@@ -1368,7 +1490,18 @@ class BatchedController:
             device=self.device,
         )
 
-    def step(self, q: np.ndarray) -> dict:
+    def step(self, q, read: bool = True):
+        """One command tick.
+
+        `read=False` leaves every result on the device and returns None, which is
+        what a batched training loop wants: `read()` pulls SIXTEEN arrays to the
+        host and each one is a sync, so calling it per tick costs more than the
+        solve.  With `read=False` this method issues launches and nothing else --
+        no host sync, no allocation, no Python branch on a device value -- which
+        is also the precondition for capturing the tick in a CUDA graph.
+        Device results are the public attributes (`q_target`, `qd`, `p_cmd`, ...);
+        `wp.to_torch` on them is zero copy.
+        """
         st = self.st
         self._upload_q(q)
         self._fk()
@@ -1432,7 +1565,7 @@ class BatchedController:
             ],
             device=self.device,
         )
-        return self.read()
+        return self.read() if read else None
 
     # ------------------------------------------------------------------ #
     def read(self) -> dict:

@@ -325,6 +325,49 @@ def _env_primitive(entry: dict[str, Any], i: int) -> EnvPrimitive:
     return EnvPrimitive(name, ptype, pose, dims)
 
 
+def config_stamp(cell: "CellSpec") -> dict:
+    """Identity of the resolved configuration, for stamping artifacts.
+
+    A dataset or a trained policy is only valid against the controller that
+    produced it, and this package is still moving: the tracking law, the feedback
+    gain and the joint-velocity governor all changed materially in one day.  A
+    stamp makes that visible instead of silent -- an artifact whose stamp does not
+    match the current build is suspect by construction, which is the only way to
+    catch a controller change that alters behaviour without erroring.
+
+    The hash covers everything that changes what the controller DOES: the
+    resolved limits and gains dicts, and the cell's own structure (joint order,
+    tool frames, effector widths, rest posture, sphere and pair counts).  It
+    deliberately does NOT cover file paths or comments, so moving a config
+    without changing it keeps the stamp -- and it deliberately DOES cover
+    `remoroo_lc.__version__`, because a code change with identical config is
+    exactly the case that would otherwise slip through.
+    """
+    import hashlib  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from remoroo_lc import __version__  # noqa: PLC0415
+
+    payload = {
+        "version": __version__,
+        "spec": cell.spec_version,
+        "limits": cell.limits,
+        "gains": cell.gains,
+        "joints": list(cell.joint_labels()),
+        "tcps": [(t.name, t.model, t.frame, t.effector.width) for t in cell.tcps],
+        "rest": [float(v) for v in cell.rest_posture()],
+        "n_spheres": sum(len(v) for m in cell.spheres.values() for v in m.values()),
+        "environment": [(e.name, e.ptype) for e in cell.environment],
+        "collision": cell.collision,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return {
+        "version": __version__,
+        "cell": cell.name,
+        "stamp": hashlib.sha256(blob).hexdigest()[:16],
+    }
+
+
 def load_cell(
     path: str | Path,
     limits_path: str | Path | None = None,

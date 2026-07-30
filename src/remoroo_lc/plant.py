@@ -113,6 +113,71 @@ class Plant:
         return self.q.copy(), self.qd.copy()
 
     # ------------------------------------------------------------------ #
+    def parameters(self) -> dict:
+        """The plant contract, as data, for anyone who has to REBUILD this plant.
+
+        In simulation `plant.py` does not run -- the physics engine integrates the
+        actuator instead -- so the sim has to instantiate an equivalent one.  If it
+        does not match, the controller was tuned against one system and the policy
+        learns against another, and nothing downstream would report the
+        difference.  So the definition is published rather than left implicit in
+        whichever yaml this class happened to read.
+
+        The law is, per joint, decoupled:
+
+            inertia * qdd = kp * (q_target_delayed - q) - kd * qd
+
+        integrated with semi-implicit Euler at `plant_rate_hz`, with `q_target`
+        held for `command_delay_ticks` COMMAND ticks before it is applied.
+
+        For a MuJoCo position actuator the mapping is:
+            gainprm  = (kp,)
+            biasprm  = (0, -kp, -kd)
+            armature = inertia            (on the JOINT, not the actuator)
+        which reproduces `kp*(target - q) - kd*qd` as the applied force with the
+        same effective inertia.  Two things do not transfer and must be built
+        around: MuJoCo has no delay primitive, so `command_delay_ticks` has to
+        become an explicit ring buffer of `q_target` on the bridge; and MuJoCo's
+        own timestep must divide the command period exactly, as `plant_rate_hz`
+        does here, or the two integrate different numbers of substeps per command.
+
+        The delay is load-bearing, not incidental: holding a target for N command
+        ticks caps the achievable joint velocity at 1/(1+N) of what a zero-delay
+        plant would reach, and that ceiling is part of what the controller was
+        tuned against.
+
+        WARNING, and it is the important part: these numbers are PLACEHOLDERS for
+        every cell shipped today.  `configs/gains.default.yaml` says so, and
+        `scripts/sysid_tapes.py` exists to replace them with measurements from a
+        real arm -- which has never been run against the rig.  Reproducing them
+        faithfully in sim reproduces a fictional actuator faithfully.  Match the
+        contract by all means, but treat agreement as "sim matches our model of
+        the plant", never as "sim matches the robot".
+        """
+        return {
+            "law": "inertia * qdd = kp * (q_target_delayed - q) - kd * qd",
+            "integrator": "semi-implicit Euler",
+            "joint_names": list(self.cell.joint_labels()),
+            "kp": [float(v) for v in self.kp],
+            "kd": [float(v) for v in self.kd],
+            "inertia": [float(v) for v in self.inertia],
+            "plant_rate_hz": float(self.plant_hz),
+            "command_hz": float(self.cell.limits["rates"]["command_hz"]),
+            "command_delay_ticks": int(self.delay_ticks),
+            "substeps_per_command": int(self.substeps),
+            "natural_frequency_rad_s": [float(v) for v in self.natural_frequency()],
+            "velocity_ceiling_fraction": 1.0 / (1.0 + float(self.delay_ticks)),
+            "mujoco_position_actuator": {
+                "gainprm": "(kp,)",
+                "biasprm": "(0, -kp, -kd)",
+                "armature": "inertia, set on the joint",
+                "delay": "NOT representable in MuJoCo; hold q_target in a ring buffer",
+            },
+            "values_are_measured": False,
+            "values_provenance": "configs/gains.default.yaml placeholders; "
+            "run scripts/sysid_tapes.py against the real cell to replace them",
+        }
+
     @property
     def state(self) -> tuple[np.ndarray, np.ndarray]:
         return self.q.copy(), self.qd.copy()
