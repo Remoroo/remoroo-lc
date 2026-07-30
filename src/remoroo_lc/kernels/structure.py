@@ -85,6 +85,7 @@ class CellStructure:
     bound_radius: np.ndarray  # (L,)
     n_blocks: int
     n_rr: int  # robot-robot pairs; env pairs occupy [n_rr, n_pairs)
+    pair_block: np.ndarray  # (P,) block index per pair, -1 if not broadphased
     pair_kind: np.ndarray  # (P,) int32
     pair_a: np.ndarray  # (P,) int32
     pair_b: np.ndarray  # (P,) int32
@@ -127,6 +128,19 @@ class CellStructure:
     cd_infl: float
     delta_mode: int  # 0 = cumulative, 1 = per_observation
     track_mode: int  # 0 = point_to_point, 1 = follower (see ChunkInterpolator)
+
+
+def _pair_block(walls) -> np.ndarray:
+    """Block index per pair, -1 where the broadphase does not apply.
+
+    Lets the per-(env, pair) kernel consult block liveness with one lookup
+    instead of searching, which is what makes the parallel form as cheap as the
+    serial one per row.
+    """
+    pb = np.full(len(walls.pairs), -1, dtype=np.int32)
+    for k, (a, c) in enumerate(zip(walls.blk_start, walls.blk_count)):
+        pb[int(a) : int(a) + int(c)] = k
+    return pb
 
 
 def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStructure:
@@ -218,6 +232,7 @@ def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStruc
         bound_radius=walls.bound_radius.astype(DTYPE),
         n_blocks=int(walls.blk_start.size),
         n_rr=int(np.count_nonzero(walls.pairs.kind == 0)),
+        pair_block=_pair_block(walls),
         pair_kind=walls.pairs.kind.astype(np.int32),
         pair_a=walls.pairs.a.astype(np.int32),
         pair_b=walls.pairs.b.astype(np.int32),

@@ -64,6 +64,11 @@ def _pad1(a: np.ndarray) -> np.ndarray:
 
 
 @wp.func
+def cspan_of(cd_infl: float, cd_safe: float) -> float:
+    return cd_infl - cd_safe
+
+
+@wp.func
 def rot_of(T: wp.mat44f) -> wp.mat33f:
     return wp.mat33f(
         T[0, 0], T[0, 1], T[0, 2],
@@ -767,46 +772,37 @@ def env_distance(
 
 
 @wp.kernel
-def k_walls(
+def k_walls_joint(
     q: wp.array2d(dtype=wp.float32),
-    sphere_c: wp.array2d(dtype=wp.vec3f),
-    Js: wp.array3d(dtype=wp.vec3f),
-    sphere_radius: wp.array(dtype=wp.float32),
-    pair_kind: wp.array(dtype=wp.int32),
-    pair_a: wp.array(dtype=wp.int32),
-    pair_b: wp.array(dtype=wp.int32),
-    env_type: wp.array(dtype=wp.int32),
-    env_pose: wp.array(dtype=wp.mat44f),
-    env_dims: wp.array(dtype=wp.vec3f),
     q_lo: wp.array(dtype=wp.float32),
     q_hi: wp.array(dtype=wp.float32),
-    lam: wp.array2d(dtype=wp.float32),
     link_T: wp.array2d(dtype=wp.mat44f),
     blk_ia: wp.array(dtype=wp.int32),
     blk_ib: wp.array(dtype=wp.int32),
-    blk_start: wp.array(dtype=wp.int32),
-    blk_count: wp.array(dtype=wp.int32),
     bound_link: wp.array(dtype=wp.int32),
     bound_centre: wp.array(dtype=wp.vec3f),
     bound_radius: wp.array(dtype=wp.float32),
-    bound_world: wp.array2d(dtype=wp.vec3f),
     n_blocks: int,
-    n_rr: int,
     n_bounds: int,
     n_joints: int,
-    n_pairs: int,
     jl_xi: float,
     jl_safe: float,
     jl_infl: float,
-    cd_xi: float,
-    cd_safe: float,
     cd_infl: float,
     G: wp.array3d(dtype=wp.float32),
     h: wp.array2d(dtype=wp.float32),
     dist_out: wp.array2d(dtype=wp.float32),
-    min_pair: wp.array(dtype=wp.float32),
     min_margin: wp.array(dtype=wp.float32),
+    min_pair: wp.array(dtype=wp.float32),
+    bound_world: wp.array2d(dtype=wp.vec3f),
+    blk_live: wp.array2d(dtype=wp.int32),
 ):
+    """Per-ENVIRONMENT half: joint-limit rows, link bounds, block liveness.
+
+    Split out from the collision rows so those can be launched per (env, pair).
+    Everything here is O(joints) or O(links) and genuinely wants one thread per
+    environment; the collision rows are O(pairs) and do not.
+    """
     b = wp.tid()
     span = jl_infl - jl_safe
 
@@ -833,26 +829,13 @@ def k_walls(
     for j in range(n_joints):
         mm = wp.min(mm, wp.min(dist_out[b, j], dist_out[b, n_joints + j]))
     min_margin[b] = mm
+    min_pair[b] = BIG_F  # seeded here; the pair kernel atomically minimises into it
 
-    base = 2 * n_joints
-    cspan = cd_infl - cd_safe
-    # n_blocks == 0 means the broadphase is off: the pair loop below starts at 0
-    # and covers the robot-robot rows itself, exactly as it did before.
-    rr_from = int(0)
-    if n_blocks > 0:
-        rr_from = n_rr
-    mp = BIG_F
-    # --- link-level broadphase ------------------------------------------- #
-    # One bounding-sphere test per LINK PAIR retires every sphere pair between
-    # those links.  Sound because each bound provably encloses its link's
-    # spheres, so a block whose bounds are further apart than d_infl contains no
-    # pair within d_infl.  Measured on the rig cell: 401 blocks cover 38,532
-    # sphere pairs, and only ~15 blocks are ever close along a real trajectory.
     for k in range(n_bounds):
         Tb = link_T[b, bound_link[k]]
         bound_world[b, k] = rot_of(Tb) * bound_centre[k] + pos_of(Tb)
 
-    for blk in range(n_blocks):  # n_blocks == 0 disables the broadphase
+    for blk in range(n_blocks):
         ka = blk_ia[blk]
         kb = blk_ib[blk]
         gap = (
@@ -860,76 +843,191 @@ def k_walls(
             - bound_radius[ka]
             - bound_radius[kb]
         )
+        if gap < cd_infl:
+            blk_live[b, blk] = 1
+        else:
+            blk_live[b, blk] = 0
+
+
+@wp.func
+def wall_pair_row(
+    b: int,
+    p: int,
+    sphere_c: wp.array2d(dtype=wp.vec3f),
+    Js: wp.array3d(dtype=wp.vec3f),
+    sphere_radius: wp.array(dtype=wp.float32),
+    pair_kind: wp.array(dtype=wp.int32),
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    env_type: wp.array(dtype=wp.int32),
+    env_pose: wp.array(dtype=wp.mat44f),
+    env_dims: wp.array(dtype=wp.vec3f),
+    lam: wp.array2d(dtype=wp.float32),
+    n_joints: int,
+    cd_xi: float,
+    cd_safe: float,
+    cd_infl: float,
+    G: wp.array3d(dtype=wp.float32),
+    h: wp.array2d(dtype=wp.float32),
+    dist_out: wp.array2d(dtype=wp.float32),
+) -> float:
+    """One collision row, assuming the caller has already decided it is live.
+
+    Shared by the serial and parallel wall kernels so the two launch shapes
+    cannot compute different numbers.  The broadphase decision lives in the
+    CALLER because the two shapes want it at different granularities: the
+    parallel kernel tests one block flag per thread, the serial one skips whole
+    contiguous ranges without touching them.  Returns the distance.
+    """
+    row = 2 * n_joints + p
+    ia = pair_a[p]
+    ib = pair_b[p]
+    d = float(0.0)
+    nrm = wp.vec3f(0.0, 0.0, 0.0)
+    if pair_kind[p] == PAIR_RR:
+        diff = sphere_c[b, ia] - sphere_c[b, ib]
+        dist = wp.length(diff)
+        nrm = diff / (dist + EPS_F)
+        d = dist - sphere_radius[ia] - sphere_radius[ib]
+    else:
+        res = env_distance(env_type[ib], env_pose[ib], env_dims[ib], sphere_c[b, ia])
+        nrm = wp.vec3f(res[1], res[2], res[3])
+        d = res[0] - sphere_radius[ia]
+
+    dist_out[b, row] = d
+    if d < cd_infl:
+        h[b, row] = cd_xi * (d - cd_safe) / (cd_infl - cd_safe)
+    else:
+        h[b, row] = BIG_F
+
+    if d < cd_infl or lam[b, row] != 0.0:
+        if pair_kind[p] == PAIR_RR:
+            for j in range(n_joints):
+                G[b, row, j] = -wp.dot(nrm, Js[b, ia, j] - Js[b, ib, j])
+        else:
+            for j in range(n_joints):
+                G[b, row, j] = -wp.dot(nrm, Js[b, ia, j])
+    return d
+
+
+@wp.kernel
+def k_walls_pairs(
+    sphere_c: wp.array2d(dtype=wp.vec3f),
+    Js: wp.array3d(dtype=wp.vec3f),
+    sphere_radius: wp.array(dtype=wp.float32),
+    pair_kind: wp.array(dtype=wp.int32),
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    pair_block: wp.array(dtype=wp.int32),
+    blk_live: wp.array2d(dtype=wp.int32),
+    env_type: wp.array(dtype=wp.int32),
+    env_pose: wp.array(dtype=wp.mat44f),
+    env_dims: wp.array(dtype=wp.vec3f),
+    lam: wp.array2d(dtype=wp.float32),
+    n_joints: int,
+    cd_xi: float,
+    cd_safe: float,
+    cd_infl: float,
+    G: wp.array3d(dtype=wp.float32),
+    h: wp.array2d(dtype=wp.float32),
+    dist_out: wp.array2d(dtype=wp.float32),
+    min_pair: wp.array(dtype=wp.float32),
+):
+    """One thread per (environment, pair).  The CUDA shape.
+
+    The collision rows are embarrassingly parallel -- each writes its own row and
+    reads only shared read-only geometry -- so pinning them one-per-environment
+    left the GPU idle: 4096 threads is a few percent of an A10G's slots while
+    each walked 40,000 pairs serially.
+
+    `min_pair` is an atomic min, which is safe for determinism precisely because
+    min is associative and commutative: the result does not depend on arrival
+    order, unlike a sum.  k_solve's PGS is untouched and stays one thread per
+    environment -- there the ordering IS the algorithm.
+    """
+    b, p = wp.tid()
+    blk = pair_block[p]
+    if blk >= 0:
+        if blk_live[b, blk] == 0:
+            row = 2 * n_joints + p
+            h[b, row] = BIG_F
+            dist_out[b, row] = BIG_F
+            return
+    d = wall_pair_row(
+        b, p, sphere_c, Js, sphere_radius, pair_kind, pair_a, pair_b,
+        env_type, env_pose, env_dims, lam, n_joints, cd_xi, cd_safe,
+        cd_infl, G, h, dist_out,
+    )
+    wp.atomic_min(min_pair, b, d)
+
+
+@wp.kernel
+def k_walls_pairs_serial(
+    sphere_c: wp.array2d(dtype=wp.vec3f),
+    Js: wp.array3d(dtype=wp.vec3f),
+    sphere_radius: wp.array(dtype=wp.float32),
+    pair_kind: wp.array(dtype=wp.int32),
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    pair_block: wp.array(dtype=wp.int32),
+    blk_live: wp.array2d(dtype=wp.int32),
+    env_type: wp.array(dtype=wp.int32),
+    env_pose: wp.array(dtype=wp.mat44f),
+    env_dims: wp.array(dtype=wp.vec3f),
+    lam: wp.array2d(dtype=wp.float32),
+    blk_start: wp.array(dtype=wp.int32),
+    blk_count: wp.array(dtype=wp.int32),
+    n_blocks: int,
+    n_rr: int,
+    n_pairs: int,
+    n_joints: int,
+    cd_xi: float,
+    cd_safe: float,
+    cd_infl: float,
+    G: wp.array3d(dtype=wp.float32),
+    h: wp.array2d(dtype=wp.float32),
+    dist_out: wp.array2d(dtype=wp.float32),
+    min_pair: wp.array(dtype=wp.float32),
+):
+    """One thread per environment, looping pairs.  The CPU shape.
+
+    Measured: launching (env, pair) on the CPU backend costs 3.5x, because each
+    of the 20 million thread invocations carries real per-thread overhead and
+    there is no wide parallelism to recover it.  The edge box runs single-
+    instance on CPU, so it gets this shape and the training fleet gets the other.
+    Identical arithmetic -- both call wall_pair_row.
+    """
+    b = wp.tid()
+    base = 2 * n_joints
+    mp = BIG_F
+    rr_from = int(0)
+    if n_blocks > 0:
+        rr_from = n_rr
+    for blk in range(n_blocks):
         lo_p = blk_start[blk]
         hi_p = lo_p + blk_count[blk]
-        if gap >= cd_infl:
-            # Park the whole block.  The row keeps its slot -- same shape, same
-            # meaning -- it is simply known to be inactive without looking.
+        if blk_live[b, blk] == 0:
+            # Park the whole range without touching a single sphere: this is the
+            # point of the serial shape, and testing per pair instead cost 2.3x.
             for p in range(lo_p, hi_p):
-                row = base + p
-                h[b, row] = BIG_F
-                dist_out[b, row] = BIG_F
+                h[b, base + p] = BIG_F
+                dist_out[b, base + p] = BIG_F
         else:
             for p in range(lo_p, hi_p):
-                row = base + p
-                ia = pair_a[p]
-                ib = pair_b[p]
-                diff = sphere_c[b, ia] - sphere_c[b, ib]
-                dist = wp.length(diff)
-                nrm = diff / (dist + EPS_F)
-                d = dist - sphere_radius[ia] - sphere_radius[ib]
-                dist_out[b, row] = d
-                if d < cd_infl:
-                    h[b, row] = cd_xi * (d - cd_safe) / cspan
-                else:
-                    h[b, row] = BIG_F
+                d = wall_pair_row(
+                    b, p, sphere_c, Js, sphere_radius, pair_kind, pair_a, pair_b,
+                    env_type, env_pose, env_dims, lam, n_joints,
+                    cd_xi, cd_safe, cd_infl, G, h, dist_out,
+                )
                 mp = wp.min(mp, d)
-                if d < cd_infl or lam[b, row] != 0.0:
-                    for j in range(n_joints):
-                        G[b, row, j] = -wp.dot(nrm, Js[b, ia, j] - Js[b, ib, j])
-
-    # With the broadphase disabled (n_blocks == 0) this loop starts at 0 and
-    # covers the robot-robot rows too, which is the original behaviour.
     for p in range(rr_from, n_pairs):
-        row = base + p
-        ia = pair_a[p]
-        d = float(0.0)
-        nrm = wp.vec3f(0.0, 0.0, 0.0)
-        ib = pair_b[p]
-        if pair_kind[p] == PAIR_RR:
-            diff = sphere_c[b, ia] - sphere_c[b, ib]
-            dist = wp.length(diff)
-            nrm = diff / (dist + EPS_F)
-            d = dist - sphere_radius[ia] - sphere_radius[ib]
-        else:
-            res = env_distance(env_type[ib], env_pose[ib], env_dims[ib], sphere_c[b, ia])
-            nrm = wp.vec3f(res[1], res[2], res[3])
-            d = res[0] - sphere_radius[ia]
-        dist_out[b, row] = d
-        if d < cd_infl:
-            h[b, row] = cd_xi * (d - cd_safe) / cspan
-        else:
-            h[b, row] = BIG_F
+        d = wall_pair_row(
+            b, p, sphere_c, Js, sphere_radius, pair_kind, pair_a, pair_b,
+            env_type, env_pose, env_dims, lam, n_joints,
+            cd_xi, cd_safe, cd_infl, G, h, dist_out,
+        )
         mp = wp.min(mp, d)
-
-        # Project the Jacobians only for rows the solver will actually read.
-        # The distance is one subtraction and a norm; the row is n dot products
-        # over 3-vectors, so filling all of them costs 20x what deciding costs.
-        # A pair beyond d_infl with no carried multiplier is parked, and a parked
-        # row's G is never touched by the sweep or by the diagnostics.
-        if d < cd_infl or lam[b, row] != 0.0:
-            if pair_kind[p] == PAIR_RR:
-                for j in range(n_joints):
-                    G[b, row, j] = -wp.dot(nrm, Js[b, ia, j] - Js[b, ib, j])
-            else:
-                for j in range(n_joints):
-                    G[b, row, j] = -wp.dot(nrm, Js[b, ia, j])
     min_pair[b] = mp
-
-
-# --------------------------------------------------------------------------- #
-# Layer 3b: dual projected Gauss-Seidel, then the box clamp and output
-# --------------------------------------------------------------------------- #
 
 
 @wp.kernel
@@ -1332,6 +1430,7 @@ class BatchedController:
             wp.vec3f,
         )
         self.bound_radius = arr(_pad1(st.bound_radius), f32)
+        self.pair_block = arr(_pad1i(st.pair_block), wp.int32)
         self.pair_a = arr(st.pair_a, wp.int32)
         self.pair_b = arr(st.pair_b, wp.int32)
         self.env_type = arr(st.env_type, wp.int32)
@@ -1414,6 +1513,7 @@ class BatchedController:
         self.Dscratch = z((b, st.n_rows))
         self.live_idx = z((b, st.n_rows), wp.int32)
         self.bound_world = z((b, max(len(st.bound_link), 1)), wp.vec3f)
+        self.blk_live = z((b, max(st.n_blocks, 1)), wp.int32)
         self.qdscratch = z((b, n))
 
         # outputs
@@ -1619,22 +1719,45 @@ class BatchedController:
             device=self.device,
         )
         wp.launch(
-            k_walls,
+            k_walls_joint,
             dim=self.num_envs,
             inputs=[
-                self.q, self.sphere_c, self.Js, self.sphere_radius,
-                self.pair_kind, self.pair_a, self.pair_b,
-                self.env_type, self.env_pose, self.env_dims,
-                self.q_lo, self.q_hi, self.lam,
-                self.link_T, self.blk_ia, self.blk_ib, self.blk_start, self.blk_count,
-                self.bound_link, self.bound_centre, self.bound_radius, self.bound_world,
-                st.n_blocks, st.n_rr, len(st.bound_link),
-                st.n_joints, st.n_pairs,
-                st.jl_xi, st.jl_safe, st.jl_infl, st.cd_xi, st.cd_safe, st.cd_infl,
+                self.q, self.q_lo, self.q_hi, self.link_T,
+                self.blk_ia, self.blk_ib, self.bound_link, self.bound_centre,
+                self.bound_radius, st.n_blocks, len(st.bound_link), st.n_joints,
+                st.jl_xi, st.jl_safe, st.jl_infl, st.cd_infl,
             ],
-            outputs=[self.G, self.h, self.dist, self.min_pair, self.min_margin],
+            outputs=[
+                self.G, self.h, self.dist, self.min_margin, self.min_pair,
+                self.bound_world, self.blk_live,
+            ],
             device=self.device,
         )
+        if st.n_pairs:
+            # Launch SHAPE is a device decision, not a semantic one: both kernels
+            # call the same wall_pair_row.  See k_walls_pairs_serial.
+            wp.launch(
+                k_walls_pairs if self.device.startswith("cuda") else k_walls_pairs_serial,
+                dim=(self.num_envs, st.n_pairs)
+                if self.device.startswith("cuda")
+                else self.num_envs,
+                inputs=[
+                    self.sphere_c, self.Js, self.sphere_radius, self.pair_kind,
+                    self.pair_a, self.pair_b, self.pair_block, self.blk_live,
+                    self.env_type, self.env_pose, self.env_dims, self.lam,
+                ]
+                + (
+                    []
+                    if self.device.startswith("cuda")
+                    else [
+                        self.blk_start, self.blk_count,
+                        st.n_blocks, st.n_rr, st.n_pairs,
+                    ]
+                )
+                + [st.n_joints, st.cd_xi, st.cd_safe, st.cd_infl],
+                outputs=[self.G, self.h, self.dist, self.min_pair],
+                device=self.device,
+            )
         wp.launch(
             k_solve,
             dim=self.num_envs,
