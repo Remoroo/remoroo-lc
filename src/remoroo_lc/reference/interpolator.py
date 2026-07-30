@@ -1,8 +1,7 @@
-"""Layer 1: chunk interpolator with jerk limiting.
+"""Layer 1: chunk interpolator.  Two tracking laws, selected by `task.mode`.
 
 A policy emits a chunk of K actions at policy rate.  This layer turns that into a
-task-space pose target per TCP at command rate, under per-axis limits on
-velocity, acceleration and jerk.
+task-space pose target per TCP at command rate.
 
 Command state (x, v, a) is carried across chunk boundaries and never reset at a
 seam; that carried state is what makes the seam smooth.  x is held in the model's
@@ -11,13 +10,31 @@ orientation as a *continuous* rotation vector, unwrapped against the previous
 tick rather than re-derived from a matrix each time, so that (v, a) in rotation
 coordinates stay meaningful across a full turn.
 
-The clamping law is deliberately not time-optimal.  It is a fixed sequence of
-arithmetic operations with no data-dependent branching and no iteration, so two
-runs on two devices produce identical trajectories.  Ruckig would produce a
-better-shaped trajectory; it would not produce the same one twice on two
-different machines under the same guarantee, and this is a determinism-first
-component.  What is checked against Ruckig is that our trajectory respects the
-same limits and lands in the same place.
+`point_to_point` is the no-preview law: each waypoint is treated as a place the
+axis must be able to STOP, tracked with nested jerk-limited braking laws.  That
+is the only safe assumption when the future is unknown -- the target may never
+move again -- and it is the right mode for sparse, terminal targets.  Its cost
+is structural: it plans a stop toward every waypoint and is interrupted by the
+next one, so on a path sampled faster than it can settle it chronically
+under-travels.  Measured on the rig's 60 s teach recording (0.43 Hz hand
+motion), that is a ~2x amplitude loss.
+
+`follower` is the preview law, for the VLA case this controller exists for: the
+policy hands over K = 8-16 future poses at 20 ms spacing, so interior waypoints
+are VIA points with known future, not destinations.  The chunk becomes one C1
+cubic Hermite through all K waypoints -- knot velocities from central
+differences, so the command passes THROUGH each waypoint at path speed instead
+of braking at it.  Past the final waypoint it decelerates to rest at constant
+deceleration over one chunk duration: the runway.  A policy that stops sending
+chunks gets a smooth stop along its own last path, spending at most half the
+distance it had already committed to.  There are no speed clamps in this mode
+-- the chunk defines the motion, and the real limits live in joint space
+(URDF velocity limits, layer 3) where they are measured rather than invented.
+
+Both laws are fixed sequences of arithmetic with no data-dependent iteration,
+so two runs on two devices produce identical trajectories.  The follower is the
+stronger case: polynomial evaluation has none of the sqrt/cbrt cusps that made
+the point-to-point law need its lag constants (see AxisLimits).
 """
 
 from __future__ import annotations
@@ -153,19 +170,24 @@ def jerk_limited_step(
 
 
 class ChunkInterpolator:
-    """Per-TCP jerk-limited command generator, sized entirely from the cell."""
+    """Per-TCP command generator, sized entirely from the cell."""
 
     #: How a chunk's K deltas compose.  "cumulative" integrates them (delta k is
     #: applied on top of waypoint k-1); "per_observation" anchors every delta to
     #: the pose observed at chunk start.  For K = 1 the two agree.  See README
     #: for the note on verifying this against Isaac-GR00T before VLA integration.
     DELTA_MODES = ("cumulative", "per_observation")
+    #: Tracking law.  See the module docstring; "follower" is the VLA mode.
+    TRACK_MODES = ("point_to_point", "follower")
 
     def __init__(self, cell: CellSpec, delta_mode: str = "cumulative") -> None:
         if delta_mode not in self.DELTA_MODES:
             raise ValueError(f"delta_mode must be one of {self.DELTA_MODES}")
         self.cell = cell
         self.delta_mode = delta_mode
+        self.mode = str(cell.limits["task"].get("mode", "point_to_point"))
+        if self.mode not in self.TRACK_MODES:
+            raise ValueError(f"task.mode must be one of {self.TRACK_MODES}")
         self.lim = AxisLimits.from_limits(cell.limits)
         rates = cell.limits["rates"]
         self.dt_p = DTYPE(1.0 / float(rates["policy_hz"]))
@@ -208,6 +230,13 @@ class ChunkInterpolator:
         self.eff_anchor = np.zeros(self.eff_dim, dtype=DTYPE)
         self.t_chunk = DTYPE(0.0)
 
+        # Follower knots: velocity at each waypoint, and the command state
+        # captured at the seam (knot 0 of segment 0), which is what carries C1
+        # continuity across chunk replacement.
+        self.way_v = np.zeros((0, self.n_tcps, TASK_DIM), dtype=DTYPE)
+        self.seam_x = np.zeros((self.n_tcps, TASK_DIM), dtype=DTYPE)
+        self.seam_v = np.zeros((self.n_tcps, TASK_DIM), dtype=DTYPE)
+
     # ------------------------------------------------------------------ #
     def reset(self, p_base: np.ndarray, R_base: np.ndarray) -> None:
         """Initialise command state from the current TCP poses (base frame)."""
@@ -229,6 +258,9 @@ class ChunkInterpolator:
         self.anchor = self.x.copy()
         self.eff_anchor = self.eff.copy()
         self.t_chunk = DTYPE(0.0)
+        self.way_v = np.zeros((0, self.n_tcps, TASK_DIM), dtype=DTYPE)
+        self.seam_x = self.x.copy()
+        self.seam_v = self.v.copy()
 
     # ------------------------------------------------------------------ #
     def set_chunk(
@@ -297,6 +329,24 @@ class ChunkInterpolator:
         self.eff_anchor = self.eff.copy()
         self.t_chunk = DTYPE(0.0)
 
+        # Follower knot velocities, from the decoded waypoint chain itself.  The
+        # chain including its measured anchor is the path the policy declared, so
+        # the velocity through waypoint k is read off its neighbours by central
+        # difference; the last waypoint takes the backward difference, which is
+        # the speed the runway then sheds.  All of it in the unwrapped chart, so
+        # rotation differences are plain subtractions.
+        if self.mode == "follower":
+            knots = np.concatenate([anchor[None], wp], axis=0)  # (K+1, T, 6)
+            vk = np.zeros_like(wp)
+            if k_steps == 1:
+                vk[0] = (knots[1] - knots[0]) / self.dt_p
+            else:
+                vk[: k_steps - 1] = (knots[2:] - knots[:-2]) / (DTYPE(2.0) * self.dt_p)
+                vk[k_steps - 1] = (knots[k_steps] - knots[k_steps - 1]) / self.dt_p
+            self.way_v = vk.astype(DTYPE)
+            self.seam_x = self.x.copy()
+            self.seam_v = self.v.copy()
+
     # ------------------------------------------------------------------ #
     def _chunk_target(self) -> tuple[np.ndarray, np.ndarray]:
         """Time-interpolated target inside the active chunk."""
@@ -317,16 +367,74 @@ class ChunkInterpolator:
             (eff_lo + (eff_hi - eff_lo) * frac).astype(DTYPE),
         )
 
+    def _follower_state(self, t: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Evaluate the chunk spline at absolute chunk time t.
+
+        Segment s covers [s*dt_p, (s+1)*dt_p) between knots s and s+1, where
+        knot 0 is the seam (command state at chunk arrival) and knots 1..K are
+        the waypoints.  Past knot K a single Hermite segment to
+        (w_K + v_K*T/2, 0) over T = K*dt_p is EXACTLY constant deceleration
+        v_K/T -- the cubic's t^3 coefficient cancels for that endpoint choice --
+        so the runway needs no extra law and no extra constants.  Past the
+        runway: hold.
+        """
+        k_steps = self.waypoints.shape[0]
+        dt_p = float(self.dt_p)
+        s = t / dt_p
+        if s < float(k_steps):
+            i0 = min(int(s), k_steps - 1)
+            tau = DTYPE(s - i0)
+            seg_t = DTYPE(dt_p)
+            x0 = self.seam_x if i0 == 0 else self.waypoints[i0 - 1]
+            v0 = self.seam_v if i0 == 0 else self.way_v[i0 - 1]
+            x1, v1 = self.waypoints[i0], self.way_v[i0]
+        else:
+            seg_t = DTYPE(k_steps * dt_p)
+            tau = DTYPE((t - k_steps * dt_p) / float(seg_t))
+            x0, v0 = self.waypoints[k_steps - 1], self.way_v[k_steps - 1]
+            x1 = (x0 + v0 * (seg_t * DTYPE(0.5))).astype(DTYPE)
+            v1 = np.zeros_like(v0)
+            if float(tau) >= 1.0:
+                return x1.copy(), np.zeros_like(v0), np.zeros_like(v0)
+        t2 = tau * tau
+        t3 = t2 * tau
+        h00 = DTYPE(2.0) * t3 - DTYPE(3.0) * t2 + DTYPE(1.0)
+        h10 = t3 - DTYPE(2.0) * t2 + tau
+        h01 = DTYPE(-2.0) * t3 + DTYPE(3.0) * t2
+        h11 = t3 - t2
+        x = (h00 * x0 + h01 * x1 + seg_t * (h10 * v0 + h11 * v1)).astype(DTYPE)
+        d00 = (DTYPE(6.0) * t2 - DTYPE(6.0) * tau) / seg_t
+        d10 = DTYPE(3.0) * t2 - DTYPE(4.0) * tau + DTYPE(1.0)
+        d11 = DTYPE(3.0) * t2 - DTYPE(2.0) * tau
+        v = (d00 * (x0 - x1) + d10 * v0 + d11 * v1).astype(DTYPE)
+        a = (
+            (DTYPE(12.0) * tau - DTYPE(6.0)) * (x0 - x1) / (seg_t * seg_t)
+            + (DTYPE(6.0) * tau - DTYPE(4.0)) * v0 / seg_t
+            + (DTYPE(6.0) * tau - DTYPE(2.0)) * v1 / seg_t
+        ).astype(DTYPE)
+        return x, v, a
+
     def step(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Advance one command tick.
 
         Returns (p_base (T, 3), R_base (T, 3, 3), effector command).
         """
         x_tgt, eff_tgt = self._chunk_target()
-        for i in range(self.n_tcps):
-            self.x[i], self.v[i], self.a[i] = jerk_limited_step(
-                self.x[i], self.v[i], self.a[i], x_tgt[i], self.lim, float(self.dt_c)
-            )
+        if self.mode == "follower":
+            if self.waypoints.shape[0]:
+                # The command sent this tick is the pose at the END of the tick.
+                x_f, v_f, a_f = self._follower_state(float(self.t_chunk) + float(self.dt_c))
+                self.x[:] = x_f
+                self.v[:] = v_f
+                self.a[:] = a_f
+            else:
+                self.v[:] = 0.0
+                self.a[:] = 0.0
+        else:
+            for i in range(self.n_tcps):
+                self.x[i], self.v[i], self.a[i] = jerk_limited_step(
+                    self.x[i], self.v[i], self.a[i], x_tgt[i], self.lim, float(self.dt_c)
+                )
         if self.eff_dim:
             step = self.eff_rate * self.dt_c
             delta = np.clip(eff_tgt - self.eff, -step, step)

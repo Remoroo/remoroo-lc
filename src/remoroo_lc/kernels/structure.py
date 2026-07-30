@@ -112,6 +112,7 @@ class CellStructure:
     cd_safe: float
     cd_infl: float
     delta_mode: int  # 0 = cumulative, 1 = per_observation
+    track_mode: int  # 0 = point_to_point, 1 = follower (see ChunkInterpolator)
 
 
 def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStructure:
@@ -229,6 +230,9 @@ def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStruc
         cd_safe=float(lim["collision_damper"]["d_safe_m"]),
         cd_infl=float(lim["collision_damper"]["d_infl_m"]),
         delta_mode=ChunkInterpolator.DELTA_MODES.index(delta_mode),
+        track_mode=ChunkInterpolator.TRACK_MODES.index(
+            str(task.get("mode", "point_to_point"))
+        ),
     )
 
 

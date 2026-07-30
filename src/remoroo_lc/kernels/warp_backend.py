@@ -308,6 +308,10 @@ def k_interp(
     brake: float,
     lag_ticks: float,
     pos_lag_ticks: float,
+    track_mode: int,
+    way_v: wp.array4d(dtype=wp.float32),
+    seam_x: wp.array3d(dtype=wp.float32),
+    seam_v: wp.array3d(dtype=wp.float32),
     p_cmd: wp.array2d(dtype=wp.vec3f),
     R_cmd: wp.array2d(dtype=wp.mat33f),
 ):
@@ -331,45 +335,115 @@ def k_interp(
 
     t_a = lag_ticks * dt_c
     t_v = pos_lag_ticks * dt_c
-    for i in range(n_tcps):
-        for c in range(TDIM):
-            lo = float(0.0)
-            hi = float(0.0)
-            if kk == 0:
-                lo = anchor[b, i, c]
-                hi = anchor[b, i, c]
-            else:
-                if i0 == 0:
+    if track_mode == 1:
+        # Follower: evaluate the chunk Hermite at the END of this tick.  Pure
+        # polynomial -- no cusped laws, no clamps; the chunk defines the motion
+        # and joint-space safety lives in layer 3.  Mirrors
+        # ChunkInterpolator._follower_state.
+        if kk == 0:
+            for i in range(n_tcps):
+                for c in range(TDIM):
+                    v[b, i, c] = 0.0
+                    a[b, i, c] = 0.0
+        else:
+            t_next = t_chunk[b] + dt_c
+            sn = t_next / dt_p
+            for i in range(n_tcps):
+                for c in range(TDIM):
+                    x0 = float(0.0)
+                    v0 = float(0.0)
+                    x1 = float(0.0)
+                    v1 = float(0.0)
+                    tau = float(0.0)
+                    seg_t = float(0.0)
+                    hold = int(0)
+                    if sn < float(kk):
+                        j0 = int(wp.floor(sn))
+                        if j0 > kk - 1:
+                            j0 = kk - 1
+                        tau = sn - float(j0)
+                        seg_t = dt_p
+                        if j0 == 0:
+                            x0 = seam_x[b, i, c]
+                            v0 = seam_v[b, i, c]
+                        else:
+                            x0 = waypoints[b, j0 - 1, i, c]
+                            v0 = way_v[b, j0 - 1, i, c]
+                        x1 = waypoints[b, j0, i, c]
+                        v1 = way_v[b, j0, i, c]
+                    else:
+                        # Runway: one Hermite to (w_K + v_K*T/2, 0) over
+                        # T = K*dt_p is exactly constant deceleration v_K/T.
+                        seg_t = float(kk) * dt_p
+                        tau = (t_next - float(kk) * dt_p) / seg_t
+                        x0 = waypoints[b, kk - 1, i, c]
+                        v0 = way_v[b, kk - 1, i, c]
+                        x1 = x0 + v0 * seg_t * 0.5
+                        v1 = 0.0
+                        if tau >= 1.0:
+                            hold = int(1)
+                    if hold == 1:
+                        x[b, i, c] = x1
+                        v[b, i, c] = 0.0
+                        a[b, i, c] = 0.0
+                    else:
+                        t2 = tau * tau
+                        t3 = t2 * tau
+                        h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+                        h10 = t3 - 2.0 * t2 + tau
+                        h01 = -2.0 * t3 + 3.0 * t2
+                        h11 = t3 - t2
+                        x[b, i, c] = h00 * x0 + h01 * x1 + seg_t * (h10 * v0 + h11 * v1)
+                        v[b, i, c] = (
+                            (6.0 * t2 - 6.0 * tau) * (x0 - x1) / seg_t
+                            + (3.0 * t2 - 4.0 * tau + 1.0) * v0
+                            + (3.0 * t2 - 2.0 * tau) * v1
+                        )
+                        a[b, i, c] = (
+                            (12.0 * tau - 6.0) * (x0 - x1) / (seg_t * seg_t)
+                            + (6.0 * tau - 4.0) * v0 / seg_t
+                            + (6.0 * tau - 2.0) * v1 / seg_t
+                        )
+    else:
+        for i in range(n_tcps):
+            for c in range(TDIM):
+                lo = float(0.0)
+                hi = float(0.0)
+                if kk == 0:
                     lo = anchor[b, i, c]
+                    hi = anchor[b, i, c]
                 else:
-                    lo = waypoints[b, i0 - 1, i, c]
-                hi = waypoints[b, i0, i, c]
-            x_tgt = lo + (hi - lo) * frac
+                    if i0 == 0:
+                        lo = anchor[b, i, c]
+                    else:
+                        lo = waypoints[b, i0 - 1, i, c]
+                    hi = waypoints[b, i0, i, c]
+                x_tgt = lo + (hi - lo) * frac
 
-            xv = x[b, i, c]
-            vv = v[b, i, c]
-            av = a[b, i, c]
-            vmax = task_v[c]
-            amax = task_a[c]
-            jmax = task_j[c]
+                xv = x[b, i, c]
+                vv = v[b, i, c]
+                av = a[b, i, c]
+                vmax = task_v[c]
+                amax = task_a[c]
+                jmax = task_j[c]
 
-            e = x_tgt - xv
-            v_ref = sign_f(e) * wp.min(
-                wp.min(vmax, stop_velocity(wp.abs(e), amax * brake, jmax * brake)),
-                wp.abs(e) / t_v,
-            )
-            dv = v_ref - vv
-            a_ref = sign_f(dv) * wp.min(
-                wp.min(amax, wp.sqrt(2.0 * jmax * brake * wp.abs(dv))), wp.abs(dv) / t_a
-            )
-            j = wp.clamp((a_ref - av) / dt_c, -jmax, jmax)
-            av = wp.clamp(av + j * dt_c, -amax, amax)
-            vv = wp.clamp(vv + av * dt_c, -vmax, vmax)
-            xv = xv + vv * dt_c
+                e = x_tgt - xv
+                v_ref = sign_f(e) * wp.min(
+                    wp.min(vmax, stop_velocity(wp.abs(e), amax * brake, jmax * brake)),
+                    wp.abs(e) / t_v,
+                )
+                dv = v_ref - vv
+                a_ref = sign_f(dv) * wp.min(
+                    wp.min(amax, wp.sqrt(2.0 * jmax * brake * wp.abs(dv))), wp.abs(dv) / t_a
+                )
+                j = wp.clamp((a_ref - av) / dt_c, -jmax, jmax)
+                av = wp.clamp(av + j * dt_c, -amax, amax)
+                vv = wp.clamp(vv + av * dt_c, -vmax, vmax)
+                xv = xv + vv * dt_c
 
-            x[b, i, c] = xv
-            v[b, i, c] = vv
-            a[b, i, c] = av
+                x[b, i, c] = xv
+                v[b, i, c] = vv
+                a[b, i, c] = av
 
     # --- effector channels ---------------------------------------------------- #
     for c in range(eff_dim):
@@ -902,10 +976,13 @@ def k_set_chunk(
     eff_width: wp.array(dtype=wp.int32),
     eff_offset: wp.array(dtype=wp.int32),
     x: wp.array3d(dtype=wp.float32),
+    v: wp.array3d(dtype=wp.float32),
     n_tcps: int,
     eff_dim: int,
     k_steps: int,
     delta_mode: int,
+    track_mode: int,
+    dt_p: float,
     waypoints: wp.array4d(dtype=wp.float32),
     eff_waypoints: wp.array3d(dtype=wp.float32),
     anchor: wp.array3d(dtype=wp.float32),
@@ -913,6 +990,9 @@ def k_set_chunk(
     eff: wp.array2d(dtype=wp.float32),
     t_chunk: wp.array(dtype=wp.float32),
     n_way: wp.array(dtype=wp.int32),
+    way_v: wp.array4d(dtype=wp.float32),
+    seam_x: wp.array3d(dtype=wp.float32),
+    seam_v: wp.array3d(dtype=wp.float32),
 ):
     b = wp.tid()
     for i in range(n_tcps):
@@ -963,6 +1043,33 @@ def k_set_chunk(
         eff_anchor[b, c] = eff[b, c]
     t_chunk[b] = 0.0
     n_way[b] = k_steps
+
+    # Follower knots: the seam is the command state at chunk arrival (knot 0 of
+    # segment 0 -- C1 continuity across chunk replacement), and each waypoint's
+    # velocity is read off its neighbours in the decoded chain.  Mirrors the
+    # reference exactly; see ChunkInterpolator.set_chunk.
+    if track_mode == 1:
+        for i in range(n_tcps):
+            for c in range(TDIM):
+                seam_x[b, i, c] = x[b, i, c]
+                seam_v[b, i, c] = v[b, i, c]
+                if k_steps == 1:
+                    way_v[b, 0, i, c] = (waypoints[b, 0, i, c] - anchor[b, i, c]) / dt_p
+                else:
+                    for k in range(k_steps):
+                        if k == k_steps - 1:
+                            way_v[b, k, i, c] = (
+                                waypoints[b, k, i, c] - waypoints[b, k - 1, i, c]
+                            ) / dt_p
+                        else:
+                            prev = float(0.0)
+                            if k == 0:
+                                prev = anchor[b, i, c]
+                            else:
+                                prev = waypoints[b, k - 1, i, c]
+                            way_v[b, k, i, c] = (waypoints[b, k + 1, i, c] - prev) / (
+                                2.0 * dt_p
+                            )
 
 
 @wp.kernel
@@ -1111,6 +1218,10 @@ class BatchedController:
         self.eff_waypoints = z((b, self.max_chunk, max(st.eff_dim, 1)))
         self.t_chunk = z(b)
         self.n_way = z(b, wp.int32)
+        # follower knots (see k_set_chunk)
+        self.way_v = z((b, self.max_chunk, t, TASK_DIM))
+        self.seam_x = z((b, t, TASK_DIM))
+        self.seam_v = z((b, t, TASK_DIM))
         self.lam = z((b, st.n_rows))
 
         # scratch
@@ -1219,12 +1330,14 @@ class BatchedController:
             dim=self.num_envs,
             inputs=[
                 buf, self.tcp_p, self.tcp_R, self.tcp_base_inv, self.R_ref, self.pose_start,
-                self.eff_start, self.eff_width, self.eff_offset, self.x,
+                self.eff_start, self.eff_width, self.eff_offset, self.x, self.v,
                 self.st.n_tcps, self.st.eff_dim, k_steps, self.st.delta_mode,
+                self.st.track_mode, self.st.dt_p,
             ],
             outputs=[
                 self.waypoints, self.eff_waypoints, self.anchor, self.eff_anchor,
                 self.eff, self.t_chunk, self.n_way,
+                self.way_v, self.seam_x, self.seam_v,
             ],
             device=self.device,
         )
@@ -1242,6 +1355,7 @@ class BatchedController:
                 self.task_v, self.task_a, self.task_j, self.eff_rate, self.tcp_base,
                 self.R_ref, st.n_tcps, st.eff_dim, st.dt_c, st.dt_p, st.brake_margin,
                 st.accel_lag_ticks, st.pos_lag_ticks,
+                st.track_mode, self.way_v, self.seam_x, self.seam_v,
             ],
             outputs=[self.p_cmd, self.R_cmd],
             device=self.device,

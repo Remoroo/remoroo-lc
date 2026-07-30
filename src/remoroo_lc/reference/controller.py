@@ -21,6 +21,7 @@ import numpy as np
 
 from remoroo_lc.constants import BIG, DTYPE, POINT_DIM, TASK_DIM
 from remoroo_lc.reference.diffik import DiffIk, posture_velocity
+from remoroo_lc.reference.dynamics import MetricDynamics
 from remoroo_lc.reference.interpolator import ChunkInterpolator
 from remoroo_lc.reference.kinematics import KinematicTree
 from remoroo_lc.reference.solver import solve_qp
@@ -52,6 +53,15 @@ class Controller:
         self.interp = ChunkInterpolator(cell, delta_mode=delta_mode)
         self.diffik = DiffIk(cell)
         self.walls = WallBuilder(cell, self.tree)
+
+        # Layers 2+3 have two implementations.  "qp" is the stacked-DLS + PGS
+        # stack; "metric" is the single metric-weighted second-order solve in
+        # reference/dynamics.py, which exists because the QP path clamps rather
+        # than degrades when a constraint bites.
+        self.solve_mode = str(cell.limits.get("solver", {}).get("mode", "qp"))
+        if self.solve_mode not in ("qp", "metric"):
+            raise ValueError("solver.mode must be 'qp' or 'metric'")
+        self.dyn = MetricDynamics(cell) if self.solve_mode == "metric" else None
 
         sol = cell.limits["solver"]
         self.iterations = int(sol["iterations"])
@@ -111,6 +121,8 @@ class Controller:
         p_b, R_b = self.tcp_pose_base(np.asarray(q, dtype=DTYPE))
         self.interp.reset(p_b, R_b)
         self._lam = np.zeros(self.walls.n_rows, dtype=DTYPE)
+        if self.dyn is not None:
+            self.dyn.reset()
         self.tick = 0
 
     def set_chunk(self, actions: np.ndarray, q: np.ndarray) -> None:
@@ -131,10 +143,46 @@ class Controller:
         p_cw, R_cw = self._to_world(p_cb, R_cb)
 
         v_task = self.diffik.task_velocity(p_w, R_w, p_cw, R_cw)
+        walls = self.walls.assemble(q, fk)
+
+        if self.solve_mode == "metric":
+            n_jr = walls.n_joint_rows
+            dyn = self.dyn.solve(
+                q, J, p_w, R_w, p_cw, R_cw,
+                # Reuse layer 3's own rows: G already holds n^T (J_a - J_b) per
+                # pair, which is exactly the projected relative Jacobian the
+                # rank-one metric needs.  Sign flipped because G was built for
+                # "approach speed <= bound" and the metric wants gap-opening.
+                -walls.G[n_jr:], walls.distance[n_jr:],
+            )
+            q_target = (q + dyn.qd * self.dt_c).astype(DTYPE)
+            self.tick += 1
+            pair_d = walls.distance[n_jr:]
+            joint_d = walls.distance[:n_jr]
+            diag = {
+                "tick": self.tick,
+                "q_at_step": q.copy(),
+                "solve_mode": "metric",
+                "n_active": dyn.n_repulsion,
+                "n_active_rows": int(np.count_nonzero(walls.active)),
+                "wall_active": bool(dyn.n_repulsion > 0),
+                "box_clamped": int(dyn.scale < 1.0),
+                "accel_scale": dyn.scale,
+                "energy": dyn.energy,
+                "qdd": dyn.qdd.copy(),
+                "min_pair_distance": float(np.min(pair_d)) if pair_d.size else float(BIG),
+                "min_joint_margin": float(np.min(joint_d)) if joint_d.size else float(BIG),
+                "manipulability": w.copy(),
+                "task_velocity": v_task.copy(),
+            }
+            return StepOutput(
+                q_target=q_target, effector=eff, qd=dyn.qd,
+                p_cmd=p_cw, R_cmd=R_cw, p_meas=p_w, R_meas=R_w, diag=diag,
+            )
+
         ik = self.diffik.solve(J, w, v_task)
         qd_post = posture_velocity(q, self.q_rest, self.k_post)
 
-        walls = self.walls.assemble(q, fk)
         sol = solve_qp(
             ik.qd_des,
             qd_post,
