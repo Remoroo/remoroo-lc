@@ -480,6 +480,13 @@ class WallBuilder:
             self.blk_count,
         ) = group_pairs_by_link(self.pairs, self.spheres)
         self.bound_link, self.bound_centre, self.bound_radius = link_bounds(self.spheres)
+        #: Rows emitted per block.  0 keeps one row per sphere pair (the original
+        #: form).  N > 0 emits the N NEAREST pairs of each block instead, which
+        #: bounds the row count at n_blocks * N regardless of how crowded the
+        #: cell gets.  Rows are what every per-row array is sized by -- G, h,
+        #: dist, lam, the solver scratch -- so the row count, not the pair count,
+        #: is what decides how many environments fit on a GPU.
+        self.rows_per_block = int(cell.collision.get("rows_per_block", 0))
         if not self.broadphase:
             # Keep the reordering (row order is a cell property either way) but
             # drop the block table so every pair is tested.  Measured: the
@@ -495,6 +502,12 @@ class WallBuilder:
         self._blk_ib = np.asarray([slot[int(x)] for x in self.blk_link_b], dtype=np.int32)
         # Row indices per block, precomputed: the broadphase gathers these, so the
         # per-tick cost is a gather rather than an arange-and-concatenate.
+        self._pair_block_np = np.full(len(self.pairs), -1, dtype=np.int64)
+        for _k, (_a, _c) in enumerate(zip(self.blk_start, self.blk_count)):
+            self._pair_block_np[int(_a) : int(_a) + int(_c)] = _k
+        #: Blocks that had more pairs within influence than `rows_per_block`.
+        #: Non-zero means the bound is biting and should be raised.
+        self.saturated_blocks = 0
         self._blk_rows_all = [
             np.arange(int(a), int(a) + int(c), dtype=np.int64)
             for a, c in zip(self.blk_start, self.blk_count)
@@ -510,7 +523,19 @@ class WallBuilder:
         self.q_lo, self.q_hi = cell.joint_limits()
         self.n = cell.n_joints
         self.n_joint_rows = 2 * self.n
-        self.n_rows = self.n_joint_rows + len(self.pairs)
+        if self.rows_per_block > 0 and self.blk_start.size:
+            self._blk_row0 = (
+                self.n_joint_rows
+                + np.arange(self.blk_start.size, dtype=np.int64) * self.rows_per_block
+            )
+            self.n_rows = self.n_joint_rows + int(self.blk_start.size) * self.rows_per_block
+            # Env pairs keep one row each: there are few of them and they are
+            # already grouped per primitive.
+            self._env_row0 = self.n_rows
+            self.n_rows += int(np.count_nonzero(self.pairs.kind != PAIR_ROBOT_ROBOT))
+        else:
+            self.rows_per_block = 0
+            self.n_rows = self.n_joint_rows + len(self.pairs)
 
         # Row-index partition, fixed at load: which rows are robot-robot pairs and
         # which belong to each environment primitive.  Order within each group is
@@ -525,6 +550,57 @@ class WallBuilder:
             sel = np.where((kind == PAIR_ROBOT_ENV) & (self.pairs.b == e))[0]
             if sel.size:
                 self._env_rows.append((e, sel, self.pairs.a[sel]))
+
+    def _assemble_topn(self, keep, centres, J_s, G, h, active, distance, base, live_blk):
+        """Emit the N NEAREST pairs of each live block instead of all of them.
+
+        Why a bound is needed at all: every per-row array -- G at
+        (rows x joints), plus h, dist, lam and the solver scratch -- is sized by
+        the ROW count, so 40,194 rows is 2.6 MiB per environment and that, not
+        the physics, is what caps how many environments fit on a GPU.  Pruning
+        which rows are *computed* does not help; the storage is allocated either
+        way.
+
+        Why the N nearest: within one link pair the binding constraint is the
+        closest approach, and the next nearest are the ones that could become
+        binding within a tick.  Keeping several rather than one matters because
+        two links can touch at more than one place -- measured up to 324
+        simultaneously active pairs inside a single block -- and constraining
+        only the closest leaves the pair free to rotate about it.
+
+        Selection is a stable partition by distance with ties broken by pair
+        index, so it is a deterministic function of the state like everything
+        else here.  A block that has more than N pairs within influence is
+        SATURATED; the count is reported rather than swallowed, because that is
+        the condition under which this is an approximation rather than an
+        identity.
+        """
+        n = self.rows_per_block
+        ka, kb = self.pairs.a[keep], self.pairs.b[keep]
+        diff = (centres[ka] - centres[kb]).astype(DTYPE)
+        dist = np.linalg.norm(diff, axis=1).astype(DTYPE)
+        d = (dist - self.spheres.radius[ka] - self.spheres.radius[kb]).astype(DTYPE)
+        blk_of = self._pair_block_np[keep]
+        cspan = self.cd_infl - self.cd_safe
+        for b_i in live_blk:
+            m = np.where(blk_of == b_i)[0]
+            if m.size == 0:
+                continue
+            dm = d[m]
+            take = m[np.argsort(dm, kind="stable")[:n]]
+            if int(np.count_nonzero(d[m] < self.cd_infl)) > n:
+                self.saturated_blocks += 1
+            row0 = self.n_joint_rows + int(b_i) * n
+            for slot, idx in enumerate(take):
+                if d[idx] >= self.cd_infl:
+                    break
+                row = row0 + slot
+                a_i, b_s = int(ka[idx]), int(kb[idx])
+                nrm = diff[idx] / (dist[idx] + EPS)
+                G[row] = -(nrm @ (J_s[a_i] - J_s[b_s]))
+                distance[row] = d[idx]
+                h[row] = self.cd_xi * (d[idx] - self.cd_safe) / cspan
+                active[row] = True
 
     def _blk_rows(self, live_blk: np.ndarray) -> np.ndarray:
         if live_blk.size == self.blk_start.size:
@@ -605,7 +681,11 @@ class WallBuilder:
                         if live_blk.size
                         else self._rr[:0]
                     )
-                if keep.size:
+                if keep.size and self.rows_per_block > 0:
+                    self._assemble_topn(
+                        keep, centres, J_s, G, h, active, distance, base, live_blk
+                    )
+                elif keep.size:
                     ka = self.pairs.a[keep]
                     kb = self.pairs.b[keep]
                     diff = (centres[ka] - centres[kb]).astype(DTYPE)
@@ -623,11 +703,16 @@ class WallBuilder:
                     h[sel] = self.cd_xi * (d[on] - self.cd_safe) / cspan
                     active[sel] = True
 
+            env_slot = 0
             for e, sel, sph in self._env_rows:
                 prim = self.cell.environment[e]
                 sd, normal = env_distance_batch(prim, centres[sph])
                 d = (sd - self.spheres.radius[sph]).astype(DTYPE)
-                rows = base + sel
+                if self.rows_per_block > 0:
+                    rows = self._env_row0 + env_slot + np.arange(sel.size)
+                    env_slot += sel.size
+                else:
+                    rows = base + sel
                 G[rows] = -np.einsum("pi,pij->pj", normal, J_s[sph])
                 distance[rows] = d
                 on = d < self.cd_infl
