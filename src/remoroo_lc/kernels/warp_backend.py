@@ -911,6 +911,139 @@ def wall_pair_row(
 
 
 @wp.kernel
+def k_walls_block_topn(
+    sphere_c: wp.array2d(dtype=wp.vec3f),
+    Js: wp.array3d(dtype=wp.vec3f),
+    sphere_radius: wp.array(dtype=wp.float32),
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    blk_start: wp.array(dtype=wp.int32),
+    blk_count: wp.array(dtype=wp.int32),
+    blk_live: wp.array2d(dtype=wp.int32),
+    top_d: wp.array3d(dtype=wp.float32),
+    top_p: wp.array3d(dtype=wp.int32),
+    n_joints: int,
+    rows_per_block: int,
+    cd_xi: float,
+    cd_safe: float,
+    cd_infl: float,
+    G: wp.array3d(dtype=wp.float32),
+    h: wp.array2d(dtype=wp.float32),
+    dist_out: wp.array2d(dtype=wp.float32),
+    min_pair: wp.array(dtype=wp.float32),
+):
+    """One thread per (environment, link block); emits that block's N nearest pairs.
+
+    Why the row count is bounded at all: every per-row array -- G at
+    (rows x joints), plus h, dist, lam and the solver scratch -- is allocated per
+    environment, so on the rig cell 40,194 rows is 2.6 MiB/env and 89% of the
+    footprint.  That, not the physics, is what caps environments per GPU.
+    Pruning which rows are COMPUTED does not help; the storage exists either way.
+
+    Why per (env, block) and not per (env, pair): selecting the N nearest has to
+    be a deterministic function of the state, and a concurrent insertion from
+    many threads is not -- the result would depend on arrival order.  Walking a
+    block serially inside one thread makes the selection exact and reproducible,
+    while (env, block) still gives 512 x 401 threads, which is plenty of
+    parallelism.  Ties go to the lower pair index because the scan is in index
+    order and insertion is strict.
+    """
+    b, blk = wp.tid()
+    row0 = 2 * n_joints + blk * rows_per_block
+
+    for slot in range(rows_per_block):
+        top_d[b, blk, slot] = BIG_F
+        top_p[b, blk, slot] = -1
+        h[b, row0 + slot] = BIG_F
+        dist_out[b, row0 + slot] = BIG_F
+
+    if blk_live[b, blk] == 0:
+        return
+
+    lo_p = blk_start[blk]
+    hi_p = lo_p + blk_count[blk]
+    mp = BIG_F
+    for p in range(lo_p, hi_p):
+        ia = pair_a[p]
+        ib = pair_b[p]
+        diff = sphere_c[b, ia] - sphere_c[b, ib]
+        dist = wp.length(diff)
+        d = dist - sphere_radius[ia] - sphere_radius[ib]
+        mp = wp.min(mp, d)
+        if d < cd_infl:
+            # Insertion sort into the running N-best, shifting worse entries down.
+            slot = rows_per_block - 1
+            if d < top_d[b, blk, slot]:
+                while slot > 0 and d < top_d[b, blk, slot - 1]:
+                    top_d[b, blk, slot] = top_d[b, blk, slot - 1]
+                    top_p[b, blk, slot] = top_p[b, blk, slot - 1]
+                    slot = slot - 1
+                top_d[b, blk, slot] = d
+                top_p[b, blk, slot] = p
+    wp.atomic_min(min_pair, b, mp)
+
+    cspan = cd_infl - cd_safe
+    for slot in range(rows_per_block):
+        p = top_p[b, blk, slot]
+        if p < 0:
+            continue
+        row = row0 + slot
+        ia = pair_a[p]
+        ib = pair_b[p]
+        diff = sphere_c[b, ia] - sphere_c[b, ib]
+        dist = wp.length(diff)
+        nrm = diff / (dist + EPS_F)
+        d = top_d[b, blk, slot]
+        dist_out[b, row] = d
+        h[b, row] = cd_xi * (d - cd_safe) / cspan
+        for j in range(n_joints):
+            G[b, row, j] = -wp.dot(nrm, Js[b, ia, j] - Js[b, ib, j])
+
+
+@wp.kernel
+def k_walls_env_rows(
+    sphere_c: wp.array2d(dtype=wp.vec3f),
+    Js: wp.array3d(dtype=wp.vec3f),
+    sphere_radius: wp.array(dtype=wp.float32),
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    env_type: wp.array(dtype=wp.int32),
+    env_pose: wp.array(dtype=wp.mat44f),
+    env_dims: wp.array(dtype=wp.vec3f),
+    lam: wp.array2d(dtype=wp.float32),
+    n_rr: int,
+    env_row0: int,
+    n_joints: int,
+    cd_xi: float,
+    cd_safe: float,
+    cd_infl: float,
+    G: wp.array3d(dtype=wp.float32),
+    h: wp.array2d(dtype=wp.float32),
+    dist_out: wp.array2d(dtype=wp.float32),
+    min_pair: wp.array(dtype=wp.float32),
+):
+    """Environment pairs keep one row each -- there are few of them, and they are
+    already one primitive per group, so bounding them buys nothing."""
+    b, e = wp.tid()
+    p = n_rr + e
+    row = env_row0 + e
+    ia = pair_a[p]
+    ib = pair_b[p]
+    res = env_distance(env_type[ib], env_pose[ib], env_dims[ib], sphere_c[b, ia])
+    nrm = wp.vec3f(res[1], res[2], res[3])
+    d = res[0] - sphere_radius[ia]
+    dist_out[b, row] = d
+    if d < cd_infl:
+        h[b, row] = cd_xi * (d - cd_safe) / (cd_infl - cd_safe)
+    else:
+        h[b, row] = BIG_F
+    wp.atomic_min(min_pair, b, d)
+    if d < cd_infl or lam[b, row] != 0.0:
+        for j in range(n_joints):
+            G[b, row, j] = -wp.dot(nrm, Js[b, ia, j])
+
+
+@wp.kernel
 def k_walls_pairs(
     sphere_c: wp.array2d(dtype=wp.vec3f),
     Js: wp.array3d(dtype=wp.vec3f),
@@ -1514,6 +1647,9 @@ class BatchedController:
         self.live_idx = z((b, st.n_rows), wp.int32)
         self.bound_world = z((b, max(len(st.bound_link), 1)), wp.vec3f)
         self.blk_live = z((b, max(st.n_blocks, 1)), wp.int32)
+        n_top = max(st.rows_per_block, 1)
+        self.top_d = z((b, max(st.n_blocks, 1), n_top))
+        self.top_p = z((b, max(st.n_blocks, 1), n_top), wp.int32)
         self.qdscratch = z((b, n))
 
         # outputs
@@ -1733,7 +1869,37 @@ class BatchedController:
             ],
             device=self.device,
         )
-        if st.n_pairs:
+        if st.rows_per_block > 0:
+            # Bounded row layout: N nearest per link block, environment pairs
+            # one row each.  See k_walls_block_topn for why the selection is
+            # per (env, block) rather than per (env, pair).
+            wp.launch(
+                k_walls_block_topn,
+                dim=(self.num_envs, st.n_blocks),
+                inputs=[
+                    self.sphere_c, self.Js, self.sphere_radius, self.pair_a,
+                    self.pair_b, self.blk_start, self.blk_count, self.blk_live,
+                    self.top_d, self.top_p, st.n_joints, st.rows_per_block,
+                    st.cd_xi, st.cd_safe, st.cd_infl,
+                ],
+                outputs=[self.G, self.h, self.dist, self.min_pair],
+                device=self.device,
+            )
+            n_env = st.n_pairs - st.n_rr
+            if n_env:
+                wp.launch(
+                    k_walls_env_rows,
+                    dim=(self.num_envs, n_env),
+                    inputs=[
+                        self.sphere_c, self.Js, self.sphere_radius, self.pair_a,
+                        self.pair_b, self.env_type, self.env_pose, self.env_dims,
+                        self.lam, st.n_rr, st.env_row0, st.n_joints,
+                        st.cd_xi, st.cd_safe, st.cd_infl,
+                    ],
+                    outputs=[self.G, self.h, self.dist, self.min_pair],
+                    device=self.device,
+                )
+        elif st.n_pairs:
             # Launch SHAPE is a device decision, not a semantic one: both kernels
             # call the same wall_pair_row.  See k_walls_pairs_serial.
             wp.launch(

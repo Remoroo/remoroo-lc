@@ -85,6 +85,11 @@ class CellStructure:
     bound_radius: np.ndarray  # (L,)
     n_blocks: int
     n_rr: int  # robot-robot pairs; env pairs occupy [n_rr, n_pairs)
+    #: Rows emitted per link block.  0 keeps one row per sphere pair; N > 0
+    #: emits the N nearest of each block, which bounds n_rows independently of
+    #: how many pairs the cell has.  See reference.walls.
+    rows_per_block: int
+    env_row0: int  # first row of the environment-pair block
     pair_block: np.ndarray  # (P,) block index per pair, -1 if not broadphased
     pair_kind: np.ndarray  # (P,) int32
     pair_a: np.ndarray  # (P,) int32
@@ -232,6 +237,8 @@ def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStruc
         bound_radius=walls.bound_radius.astype(DTYPE),
         n_blocks=int(walls.blk_start.size),
         n_rr=int(np.count_nonzero(walls.pairs.kind == 0)),
+        rows_per_block=int(walls.rows_per_block),
+        env_row0=int(getattr(walls, "_env_row0", walls.n_joint_rows + len(walls.pairs))),
         pair_block=_pair_block(walls),
         pair_kind=walls.pairs.kind.astype(np.int32),
         pair_a=walls.pairs.a.astype(np.int32),
