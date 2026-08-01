@@ -19,13 +19,14 @@ vendor's before anything moves, which is the cheapest possible way to catch a
 calibration error.
 
     python scripts/rig_record.py --cell configs/cells/rig_bimanual_xarm6.yaml \
-        --hosts $REMOROO_LC_HOSTS,$REMOROO_LC_HOSTS --teach --seconds 40 \
+        --hosts $REMOROO_LC_HOSTS --teach --seconds 40 \
         -o recordings/reach_and_place.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
@@ -206,7 +207,11 @@ def report(rows: list[dict], rate_hz: float) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell", type=Path, required=True)
-    ap.add_argument("--hosts", required=True, help="comma-separated controller IPs")
+    ap.add_argument(
+        "--hosts",
+        default=os.environ.get("REMOROO_LC_HOSTS", ""),
+        help="comma-separated controller IPs; defaults to $REMOROO_LC_HOSTS (see .env.example)",
+    )
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--rate", type=float, default=250.0)
     ap.add_argument("--teach", action="store_true", help="hand-guide (manual mode)")

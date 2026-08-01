@@ -1,0 +1,131 @@
+# EXAMPLE cell -- copy, rename, and point at your own URDF and spheres.
+#
+# This is a real, validating instance of the contract in CELL_SPEC.md, taken
+# from a working bimanual installation with the machine-specific parts replaced.
+# It shows the shape of a two-arm cell: one URDF rooted at `world` carrying both
+# arms, so both TCPs live in one model and the solver sees a single 12-joint
+# tree and arbitrates the shared trunk in ONE solve.
+#
+# Generate a starting point for your own robot with:
+#   python scripts/cell_from_urdf.py <robot.urdf> --name my_robot -o configs/rig/my_robot.yaml
+#
+# Files under configs/rig/ other than *.example.yaml are gitignored: a cell
+# describes your actual machine and is yours, not ours.
+
+lc_spec_version: "1.0"
+name: my_bimanual_cell
+
+limits: ../limits.yaml
+gains: ../gains.default.yaml
+
+models:
+  - name: cell
+    urdf: ../../assets/rig/your_robot.urdf
+    # The rig's own coarse fit, 312 spheres, UNMODIFIED except that the overhead
+    # camera (ZEDX_Mini_3) is excluded -- it is world-fixed and the overhead_beam
+    # primitive already occupies that volume.
+    #
+    # Do NOT decimate this further.  Measured: decimating the bulk arm links puts
+    # camera_holder_1 within the 15 mm safe band of its own link4_1 on 37 of 38
+    # sampled postures along the teach recording, where the fitted set does so on
+    # ZERO.  The latency win (p99 3.77 -> 1.96 ms on the Orin) is not worth
+    # inventing a collision that is not there.  scripts/decimate_spheres.py can
+    # reduce a fine set conservatively if yours is too large; verify containment
+    # with --verify before trusting it on hardware.
+    spheres: ../../assets/rig/your_spheres.yml
+    base:
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+    joints:
+      [joint1, joint2, joint3, joint4, joint5, joint6,
+       joint1_1, joint2_1, joint3_1, joint4_1, joint5_1, joint6_1]
+    # The gripper's own DOF.  `remoroo setup` calls these ignore_joints; here they
+    # are locked, which additionally makes them RIGID -- the six links of a
+    # parallel jaw are bolted to one casting and cannot collide with each other.
+    locked_joints:
+      drive_joint: 0.0
+      left_inner_knuckle_joint: 0.0
+      right_outer_knuckle_joint: 0.0
+      right_inner_knuckle_joint: 0.0
+      left_finger_joint: 0.0
+      right_finger_joint: 0.0
+      drive_joint_1: 0.0
+      left_inner_knuckle_joint_1: 0.0
+      right_outer_knuckle_joint_1: 0.0
+      right_inner_knuckle_joint_1: 0.0
+      left_finger_joint_1: 0.0
+      right_finger_joint_1: 0.0
+    # Measured on the rig, not chosen: see scripts/rig_capture.py --home.
+    rest: [0.0, -0.35, -0.60, 0.0, 0.95, 0.0,
+           0.0, -0.35, -0.60, 0.0, 0.95, 0.0]
+
+tcps:
+  - name: arm1_tcp
+    model: cell
+    frame: link_tcp
+    effector: { kind: parallel_jaw, width: 1, default: [0.0] }
+    damping: { w_thresh: 0.001 } # placeholder until calibrate_wthresh runs
+  - name: arm2_tcp
+    model: cell
+    frame: link_tcp_1
+    effector: { kind: parallel_jaw, width: 1, default: [0.0] }
+    damping: { w_thresh: 0.001 }
+
+# Straight from the rig's own cell.yaml `obstacles`, converted to this schema.
+environment:
+  - name: table
+    type: box
+    xyz: [0.10293, -0.33497, -0.06]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    dims: [0.8, 1.9, 0.04]
+  - name: overhead_beam
+    type: box
+    xyz: [-0.76461, -0.25025, 0.92137]
+    quat: [0.99892, 0.0, 0.0, -0.04650]
+    dims: [2.13, 0.38, 0.38]
+  - name: post_left
+    type: cylinder
+    xyz: [-0.04525, 0.22309, 0.5]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    radius: 0.051
+    height: 1.0
+  - name: post_right
+    type: cylinder
+    xyz: [-0.13985, -0.90353, 0.5]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    radius: 0.055
+    height: 1.0
+  - name: rail
+    type: box
+    xyz: [-0.10032, 0.0, 0.76847]
+    quat: [0.99689, 0.0, 0.0, -0.07880]
+    dims: [0.05, 2.0, 0.06]
+  - name: wall
+    type: box
+    xyz: [-0.32627, -0.25377, 0.75]
+    quat: [0.70711, 0.0, 0.0, 0.70711]
+    dims: [2.0, 0.05, 1.5]
+
+collision:
+  # Rows emitted per link block: the N NEAREST pairs, not one row per sphere
+  # pair.  Every per-row array -- G at (rows x joints), plus h, dist, lam and
+  # the solver scratch -- is allocated per environment, so the ROW count is what
+  # caps environments per GPU: 40,194 rows is 2.6 MiB/env and 89% of the total
+  # footprint, against 0.33 MiB for the physics.  At 4 it is 3,266 rows and
+  # 0.106 MiB/env, which is the difference between ~7,500 and ~50,000
+  # environments on a 24 GiB A10G.
+  #
+  # 4 and not 1.  Measured on this cell, both arms driven straight at each other
+  # at 0.5 m/s from recorded collision-free starts, d_safe = 15 mm:
+  #   full 40194 rows  closest 14.70 mm  worst 14.49   0/10 penetrating
+  #   top-4  3266      closest 14.70     worst 14.49   0/10   <- identical
+  #   top-2  2464      closest 14.70     worst 14.49   0/10
+  #   top-1  2063      closest 14.33     worst  5.94   0/10   <- degraded
+  # Two links can touch in more than one place -- up to 324 pairs of a single
+  # block are active at once here -- so one row per block leaves the pair free
+  # to rotate about the single constrained contact.  4 holds the safety
+  # distance exactly; 1 gives away two thirds of it.
+  rows_per_block: 4
+  self_pairs: true
+  cross_model: true
+  environment: true

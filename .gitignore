@@ -9,3 +9,20 @@ dist/
 # Generated reports.  One sample per cell is committed under reports/sample/.
 reports/*
 !reports/sample/
+
+# --- your environment ------------------------------------------------------- #
+# `.env.example` is committed and describes what is needed; `.env` is yours.
+.env
+
+# Real cells, real robot geometry, real telemetry.  A cell describes somebody's
+# actual machine: its calibrated URDF, its fitted collision spheres, recordings
+# taken from it.  The repo ships the CONTRACT (CELL_SPEC.md), placeholder assets
+# that are exact validating instances of it, and a generator
+# (scripts/cell_from_urdf.py) -- never a real machine.
+#
+# Committed:   configs/rig/*.example.yaml
+# Yours:       everything else under these paths
+configs/rig/*
+!configs/rig/*.example.yaml
+assets/rig/
+recordings/

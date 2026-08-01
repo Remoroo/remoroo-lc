@@ -101,11 +101,23 @@ pip install remoroo-lc[kernels]   # + Warp kernels (batched, CUDA)
 From source:
 
 ```bash
-git clone https://github.com/remoroo/remoroo-lc && cd remoroo-lc
+git clone https://github.com/Remoroo/remoroo-lc && cd remoroo-lc
 python -m venv .venv && .venv/bin/pip install -e ".[kernels,dev]"
-.venv/bin/python -m pytest              # ~570 tests over a 5-cell matrix
+cp .env.example .env                    # your cell, your robot's IPs
+.venv/bin/python -m pytest              # ~540 tests over a 5-cell matrix
 .venv/bin/python scripts/license_check.py   # every dependency permissive
 ```
+
+The test suite needs no robot and no hardware: it runs entirely on the five
+synthetic cells in `configs/cells/`, which are chosen to disagree with each other
+(different DOF counts, redundant and over-constrained, shared joints, mixed and
+absent effectors).
+
+**Your robot's files stay yours.** `configs/rig/`, `assets/rig/` and
+`recordings/` are gitignored -- a cell describes an actual machine, including its
+calibrated URDF and fitted collision spheres. What ships is the contract
+([CELL_SPEC.md](CELL_SPEC.md)), a validating example
+(`configs/rig/bimanual.example.yaml`), placeholder assets, and a generator.
 
 ---
 

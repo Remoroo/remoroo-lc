@@ -23,6 +23,7 @@ knowing, rather than to pick one slow pass that succeeds.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
@@ -165,7 +166,11 @@ def main() -> int:
     ap.add_argument("--sim", action="store_true", help="replay against the plant")
     ap.add_argument("--hw", action="store_true", help="replay on the real cell")
     ap.add_argument("--baseline", action="store_true", help="servo the recording directly")
-    ap.add_argument("--hosts", default="", help="controller IPs, for --hw/--baseline")
+    ap.add_argument(
+        "--hosts",
+        default=os.environ.get("REMOROO_LC_HOSTS", ""),
+        help="controller IPs for --hw/--baseline; defaults to $REMOROO_LC_HOSTS",
+    )
     ap.add_argument(
         "--speeds", type=float, nargs="+", default=[1.0],
         help="time scales to sweep; >1 is faster than recorded",
