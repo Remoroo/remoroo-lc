@@ -93,25 +93,24 @@ saturating. Redundant robots have room to move and do better.
 
 ## Install
 
-```bash
-pip install remoroo-lc            # NumPy reference, CPU
-pip install remoroo-lc[kernels]   # + Warp kernels (batched, CUDA)
-```
-
-From source:
+Not on PyPI yet — install from source:
 
 ```bash
 git clone https://github.com/Remoroo/remoroo-lc && cd remoroo-lc
-python -m venv .venv && .venv/bin/pip install -e ".[kernels,dev]"
-cp .env.example .env                    # your cell, your robot's IPs
-.venv/bin/python -m pytest              # ~540 tests over a 5-cell matrix
+python -m venv .venv
+.venv/bin/pip install -e ".[kernels,dev]"   # drop [kernels] for the NumPy-only CPU path
+cp .env.example .env                        # your cell, your robot's IPs
+
+.venv/bin/python -m pytest                  # 571 tests over a 5-cell matrix
 .venv/bin/python scripts/license_check.py   # every dependency permissive
 ```
 
 The test suite needs no robot and no hardware: it runs entirely on the five
 synthetic cells in `configs/cells/`, which are chosen to disagree with each other
 (different DOF counts, redundant and over-constrained, shared joints, mixed and
-absent effectors).
+absent effectors). Roughly 30 of those tests cross-check the layers against
+independent implementations -- Ruckig, MuJoCo and ProxQP -- and are skipped if
+you install without `[dev]`.
 
 **Your robot's files stay yours.** `configs/rig/`, `assets/rig/` and
 `recordings/` are gitignored -- a cell describes an actual machine, including its
@@ -215,7 +214,7 @@ Version 0.1. Honest about what is and is not proven:
 
 | | |
 | --- | --- |
-| controller core, all three layers | measured on real hardware, ~570 tests |
+| controller core, all three layers | measured on real hardware, 571 tests |
 | CPU ↔ CUDA agreement | verified on an A10G |
 | four third-party robots incl. a 29-DOF humanoid | tracked, engine unchanged |
 | `configs/gains.default.yaml` | **placeholders.** Run `scripts/sysid_tapes.py` on your robot to measure the real values before trusting any dynamic simulation built from them |
