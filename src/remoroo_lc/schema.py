@@ -256,6 +256,97 @@ def load_limits(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(fh) or {}
 
 
+# --------------------------------------------------------------------------- #
+# control rates -- the single source of truth
+# --------------------------------------------------------------------------- #
+
+
+class RateMismatch(CellSpecError):
+    """Two declarations of the same control rate disagree.
+
+    This is its own exception type because the failure it prevents is not a
+    typo, it is a SILENT factor.  Measured on this campaign: the cell declared
+    ``policy_hz: 50`` while the training worldspec declared ``25``, and nothing
+    compared them.  remoroo-lc sized its chunk to 20 ms; the trainer fed it
+    40 ms worth of control ticks.  Every chunk was therefore executed as a
+    2x-speed sprint followed by the interpolator's deceleration runway -- a
+    0.92 -> 1.53 sawtooth in the per-tick profile -- and the policy was learning
+    against a plant that moved at twice the speed it had asked for.  Nothing
+    raised, nothing logged, and the training curve merely looked bad.
+
+    A rate that is declared twice is a rate that can disagree with itself.
+    """
+
+
+def resolve_rates(
+    cell: "CellSpec",
+    *,
+    policy_hz: float | None = None,
+    command_hz: float | None = None,
+    source: str = "caller",
+    require_exact_ticks: bool = False,
+) -> dict[str, float]:
+    """The one place a control rate is decided.  Everything else reads this.
+
+    THE CELL WINS.  ``cell.limits["rates"]`` is the rig deployment contract --
+    the rate the arm will actually be driven at when this controller ships --
+    and a training run that quietly uses a different one is training against a
+    plant it will never meet.  So a caller may DECLARE the rates it believes it
+    is using, and this function checks that belief; it may not override it.
+
+    To run the same rig at a second rate, point the cell at a second limits file
+    (``load_cell(..., limits_path=...)``) or use its ``limits_override:`` block.
+    Both are explicit, both are recorded in ``config_stamp``, and both leave
+    exactly one number in play for any given controller.
+
+    Returns policy_hz, command_hz, the exact number of control ticks per action,
+    and the two periods the kernels consume (``dt_p``, ``dt_c``).
+    """
+    rates = (cell.limits or {}).get("rates") or {}
+    out: dict[str, float] = {}
+    for key, declared in (("policy_hz", policy_hz), ("command_hz", command_hz)):
+        if key not in rates:
+            raise RateMismatch(
+                f"{cell.name}: limits.rates.{key} is not declared; "
+                f"remoroo-lc cannot size a chunk without it"
+            )
+        own = float(rates[key])
+        if own <= 0.0:
+            raise RateMismatch(f"{cell.name}: limits.rates.{key} must be positive, got {own:g}")
+        if declared is not None and abs(float(declared) - own) > 1e-9:
+            raise RateMismatch(
+                f"{cell.name}: {key} is declared twice and the two disagree -- "
+                f"the cell's limits say {own:g} Hz, {source} says {float(declared):g} Hz "
+                f"(a factor of {float(declared) / own:.4g}). "
+                f"Whichever is wrong, one of them is silently rescaling every command: "
+                f"reconcile them, or give this run its own limits file via "
+                f"load_cell(limits_path=...)."
+            )
+        out[key] = own
+
+    # Exactness binds on whoever CHUNKS -- a driver that runs a fixed number of
+    # control ticks per action.  The controller itself only ever needs the two
+    # periods, and the reference path advances by dt_c against a dt_p-long
+    # chunk quite happily at a fractional ratio, so requiring it here would
+    # reject cells that are fine.  `assert_drive_rate` is where it is enforced,
+    # against the tick count the driver will actually use.
+    ratio = out["command_hz"] / out["policy_hz"]
+    ticks = int(round(ratio))
+    exact = ticks >= 1 and abs(ratio - ticks) <= 1e-9
+    if require_exact_ticks and not exact:
+        raise RateMismatch(
+            f"{cell.name}: command_hz ({out['command_hz']:g}) must be an exact integer "
+            f"multiple of policy_hz ({out['policy_hz']:g}); the ratio is {ratio:g}. "
+            f"A fractional ratio makes the number of control ticks behind one action "
+            f"depend on accumulated float error rather than on anything declared."
+        )
+    out["ticks_per_action"] = float(ticks) if exact else 0.0
+    out["ticks_exact"] = 1.0 if exact else 0.0
+    out["dt_p"] = 1.0 / out["policy_hz"]
+    out["dt_c"] = 1.0 / out["command_hz"]
+    return out
+
+
 def load_spheres(path: str | Path) -> dict[str, list[tuple[np.ndarray, float]]]:
     """Load a collision-sphere file in cuRobo layout.
 

@@ -21,9 +21,13 @@ import numpy as np
 import warp as wp
 
 from remoroo_lc.constants import DTYPE, POINT_DIM, TASK_DIM
-from remoroo_lc.kernels.structure import CellStructure, build_structure
+from remoroo_lc.kernels.structure import (
+    CellStructure,
+    assert_drive_rate,
+    build_structure,
+)
 from remoroo_lc.reference.kinematics import KIND_PRISMATIC, KIND_REVOLUTE
-from remoroo_lc.schema import CellSpec
+from remoroo_lc.schema import CellSpec, resolve_rates
 
 wp.config.quiet = True
 wp.init()
@@ -519,6 +523,7 @@ def k_diffik(
     qd_des: wp.array2d(dtype=wp.float32),
     manip: wp.array2d(dtype=wp.float32),
     damping: wp.array2d(dtype=wp.float32),
+    governor: wp.array(dtype=wp.float32),
 ):
     b = wp.tid()
     m6 = n_tcps * TDIM
@@ -621,15 +626,23 @@ def k_diffik(
     # the damped inverse can ask for 100x what the arm can do near a singular
     # direction, and letting that reach Layer 3 makes its box annihilate the
     # tracking component along with the excess.
+    #
+    # The scale is EXPORTED.  It was measured active on 97-99% of full-scale
+    # ticks, uniformly cutting motion to ~0.45, and because nothing wrote it
+    # anywhere that looked like a healthy controller obeying a slow command.  A
+    # governor that is on almost always is not a safety net, it is a secret
+    # speed limit -- and the only way to tell those apart is to log it.
     worst = float(0.0)
     for j in range(n_joints):
         frac = wp.abs(qd_des[b, j]) / wp.max(qd_max[j], EPS_F)
         if frac > worst:
             worst = frac
+    g = float(1.0)
     if worst > 1.0:
         g = 1.0 / worst
         for j in range(n_joints):
             qd_des[b, j] = qd_des[b, j] * g
+    governor[b] = g
 
 
 @wp.func
@@ -1186,6 +1199,7 @@ def k_solve(
     max_violation: wp.array(dtype=wp.float32),
     slack_norm: wp.array(dtype=wp.float32),
     box_clamped: wp.array(dtype=wp.int32),
+    box_scale: wp.array(dtype=wp.float32),
     Dscratch: wp.array2d(dtype=wp.float32),
     qdscratch: wp.array2d(dtype=wp.float32),
     live_idx: wp.array2d(dtype=wp.int32),
@@ -1263,6 +1277,11 @@ def k_solve(
         qd_out[b, j] = v
         q_target[b, j] = q[b, j] + v * dt_c
     box_clamped[b] = nclamp
+    # Exported for the same reason as the layer-2 governor: `nclamp` says HOW
+    # MANY joints were over their limit, which is 0 whenever the box is merely
+    # halving the whole vector uniformly.  The scale is the quantity that says
+    # how much motion the safety layer actually removed.
+    box_scale[b] = scale
 
     # Diagnostics over the live rows only.  A parked row sits at h = BIG, so its
     # violation is about -1e6 and can never be the maximum, and only a live row
@@ -1517,9 +1536,19 @@ class BatchedController:
         max_chunk: int = 32,
         delta_mode: str = "cumulative",
         structure: CellStructure | None = None,
+        policy_hz: float | None = None,
     ) -> None:
         self.cell = cell
-        self.st = structure or build_structure(cell, delta_mode=delta_mode)
+        # `policy_hz` is a DECLARATION by whoever is about to drive this
+        # controller, not an override -- build_structure raises RateMismatch if
+        # it disagrees with the cell.  See schema.resolve_rates.
+        self.st = structure or build_structure(
+            cell, delta_mode=delta_mode, policy_hz=policy_hz,
+            rate_source="BatchedController(policy_hz=...)",
+        )
+        if structure is not None and policy_hz is not None:
+            resolve_rates(cell, policy_hz=policy_hz,
+                          source="BatchedController(policy_hz=...)")
         self.num_envs = int(num_envs)
         self.device = device
         self.max_chunk = int(max_chunk)
@@ -1661,6 +1690,14 @@ class BatchedController:
         self.box_clamped = z(b, wp.int32)
         self.min_pair = z(b)
         self.min_margin = z(b)
+        # Per-env activity of the two uniform slowdowns.  1.0 = the layer passed
+        # the request through untouched; anything below is motion the controller
+        # removed without the policy being told.  Seeded at 1.0 so a read before
+        # the first step is honest rather than reading "fully governed".
+        self.governor = z(b)
+        self.box_scale = z(b)
+        self.governor.fill_(1.0)
+        self.box_scale.fill_(1.0)
 
     # ------------------------------------------------------------------ #
     def _upload_q(self, q) -> None:
@@ -1850,7 +1887,7 @@ class BatchedController:
             ],
             outputs=[
                 self.A, self.L, self.Jf, self.vtask, self.yvec, self.qd_des,
-                self.manip, self.damping,
+                self.manip, self.damping, self.governor,
             ],
             device=self.device,
         )
@@ -1934,8 +1971,8 @@ class BatchedController:
             ],
             outputs=[
                 self.qd, self.q_target, self.n_active, self.max_violation,
-                self.slack_norm, self.box_clamped, self.Dscratch, self.qdscratch,
-                self.live_idx,
+                self.slack_norm, self.box_clamped, self.box_scale,
+                self.Dscratch, self.qdscratch, self.live_idx,
             ],
             device=self.device,
         )
@@ -1963,4 +2000,31 @@ class BatchedController:
             "box_clamped": self.box_clamped.numpy(),
             "min_pair_distance": self.min_pair.numpy(),
             "min_joint_margin": self.min_margin.numpy(),
+            # --- how much motion each layer removed, per env (1.0 = none) ----
+            "governor": self.governor.numpy(),
+            "box_scale": self.box_scale.numpy(),
         }
+
+    # ------------------------------------------------------------------ #
+    # rates -- read these rather than the cell's yaml, so there is one number
+    # ------------------------------------------------------------------ #
+
+    @property
+    def policy_hz(self) -> float:
+        return float(self.st.policy_hz)
+
+    @property
+    def command_hz(self) -> float:
+        return float(self.st.command_hz)
+
+    @property
+    def ticks_per_action(self) -> int:
+        """Control ticks in one action, as this controller sized its chunk."""
+        return int(self.st.ticks_per_action)
+
+    def assert_drive_rate(self, ticks_per_action: int, source: str) -> None:
+        """Raise unless `source` will execute a chunk over exactly its duration.
+
+        Whoever steps this controller should call this once at wiring time.
+        """
+        assert_drive_rate(self.st, ticks_per_action, source)

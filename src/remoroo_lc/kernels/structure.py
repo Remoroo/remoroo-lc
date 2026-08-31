@@ -21,7 +21,7 @@ import numpy as np
 from remoroo_lc.constants import DTYPE, POINT_DIM, TASK_DIM
 from remoroo_lc.reference.kinematics import KinematicTree
 from remoroo_lc.reference.walls import WallBuilder
-from remoroo_lc.schema import CellSpec
+from remoroo_lc.schema import CellSpec, RateMismatch, resolve_rates
 
 # Environment primitive type codes, shared with the kernels.
 ENV_PLANE = 0
@@ -113,6 +113,18 @@ class CellStructure:
     # scalars
     dt_c: float
     dt_p: float
+    #: The rates `dt_c`/`dt_p` came from, and the exact number of control ticks
+    #: in one action.  Carried on the structure so a caller that DRIVES this
+    #: controller can check the invariant on the built object rather than on the
+    #: yaml text: `ticks_per_action * dt_c` must equal `dt_p`, or the chunk is
+    #: being consumed at a different rate than it is being fed.  See
+    #: `schema.resolve_rates` and `assert_drive_rate`.
+    policy_hz: float
+    command_hz: float
+    #: 0 when command_hz is not an exact multiple of policy_hz -- i.e. when no
+    #: whole number of control ticks spans one action.  Such a cell can still be
+    #: driven tick-by-tick; it cannot be driven in fixed-size chunks.
+    ticks_per_action: int
     brake_margin: float
     accel_lag_ticks: float
     pos_lag_ticks: float
@@ -135,6 +147,36 @@ class CellStructure:
     track_mode: int  # 0 = point_to_point, 1 = follower (see ChunkInterpolator)
 
 
+def assert_drive_rate(structure: CellStructure, ticks_per_action: int, source: str) -> None:
+    """Check the invariant on the LIVE object: one action == one chunk duration.
+
+    `structure.dt_p` is how long the interpolator plans for a chunk to last.
+    `ticks_per_action * structure.dt_c` is how long the caller will actually
+    spend executing it.  These are the same physical quantity arrived at down
+    two different paths, so comparing them catches a divergence introduced
+    ANYWHERE -- a second yaml, a hand-set constructor argument, a stale cache --
+    and not merely two config keys that happen to be spelled differently.
+
+    This is the check that would have caught the 2x sprint on the first step of
+    the first run instead of after twenty of them.
+    """
+    ticks = int(ticks_per_action)
+    if ticks < 1:
+        raise RateMismatch(f"{source}: ticks_per_action must be >= 1, got {ticks}")
+    planned = float(structure.dt_p)
+    executed = ticks * float(structure.dt_c)
+    if abs(planned - executed) > 1e-9 * max(planned, executed):
+        raise RateMismatch(
+            f"chunk duration disagrees with the tick budget: remoroo-lc sizes a chunk "
+            f"to {planned * 1e3:.4g} ms (policy_hz {structure.policy_hz:g}), but {source} "
+            f"will execute it over {ticks} ticks = {executed * 1e3:.4g} ms "
+            # planned / executed: squeezing a 40 ms chunk into 20 ms of ticks runs it
+            # at 2x speed, not 0.5x.  The inverse reads plausible and is backwards.
+            f"(command_hz {structure.command_hz:g}). Every chunk would run at "
+            f"{planned / executed:.4g}x the commanded speed."
+        )
+
+
 def _pair_block(walls) -> np.ndarray:
     """Block index per pair, -1 where the broadphase does not apply.
 
@@ -148,10 +190,26 @@ def _pair_block(walls) -> np.ndarray:
     return pb
 
 
-def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStructure:
+def build_structure(
+    cell: CellSpec,
+    delta_mode: str = "cumulative",
+    *,
+    policy_hz: float | None = None,
+    command_hz: float | None = None,
+    rate_source: str = "build_structure(policy_hz=...)",
+) -> CellStructure:
+    """Flatten `cell` into kernel-ready arrays.
+
+    `policy_hz` / `command_hz` are a DECLARATION, not an override: pass what the
+    caller believes it will drive this controller at and `resolve_rates` raises
+    if the cell disagrees.  See `schema.resolve_rates` for why the cell wins.
+    """
     tree = KinematicTree(cell)
     walls = WallBuilder(cell, tree)
     lim = cell.limits
+    rates = resolve_rates(
+        cell, policy_hz=policy_hz, command_hz=command_hz, source=rate_source
+    )
 
     n = cell.n_joints
     n_links = tree.n_links
@@ -256,14 +314,17 @@ def build_structure(cell: CellSpec, delta_mode: str = "cumulative") -> CellStruc
         task_j=axis_vec("j_max"),
         eff_rate=np.asarray(eff_rate, dtype=DTYPE),
         eff_default=np.asarray(eff_default, dtype=DTYPE),
-        dt_c=1.0 / float(lim["rates"]["command_hz"]),
-        dt_p=1.0 / float(lim["rates"]["policy_hz"]),
+        dt_c=rates["dt_c"],
+        dt_p=rates["dt_p"],
+        policy_hz=rates["policy_hz"],
+        command_hz=rates["command_hz"],
+        ticks_per_action=int(rates["ticks_per_action"]),
         brake_margin=float(task.get("brake_margin", 0.6)),
         accel_lag_ticks=float(task.get("accel_lag_ticks", 4.0)),
         pos_lag_ticks=float(task.get("pos_lag_ticks", 12.0)),
         v_clamp_scale=float(lim["diffik"].get("v_clamp_scale", 4.0)),
-        kp_lin=float(lim["diffik"].get("kp_linear", float(lim["rates"]["command_hz"]))),
-        kp_ang=float(lim["diffik"].get("kp_angular", float(lim["rates"]["command_hz"]))),
+        kp_lin=float(lim["diffik"].get("kp_linear", rates["command_hz"])),
+        kp_ang=float(lim["diffik"].get("kp_angular", rates["command_hz"])),
         lambda_min=float(lim["diffik"]["lambda_min"]),
         lambda_max=float(lim["diffik"]["lambda_max"]),
         k_post=float(lim["posture"]["k_post"]),

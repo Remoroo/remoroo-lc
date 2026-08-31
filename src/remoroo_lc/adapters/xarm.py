@@ -91,12 +91,17 @@ class XArmUnit(RobotAdapter):
             self._estopped = False
 
     def disconnect(self) -> None:
+        """Graceful session end: back to position mode, state ready, servos
+        HOLDING.  The old set_state(4) + motion_enable(False) dropped the
+        servos and slammed the brakes in -- audible on the rig as an "abrupt
+        disable" every session end.  Brakes are for estop, not goodbye."""
         with self._lock:
             if self._arm is None:
                 return
             try:
-                self._arm.set_state(4)  # stop
-                self._arm.motion_enable(enable=False)
+                if not self._estopped:
+                    self._arm.set_mode(0)
+                    self._arm.set_state(0)
                 self._arm.disconnect()
             finally:
                 self._arm = None
@@ -138,22 +143,37 @@ class XArmUnit(RobotAdapter):
 
     def limits(self) -> UnitLimits:
         arm = self._require()
-        if self._q_lo is not None and self._q_hi is not None:
-            lo, hi = np.asarray(self._q_lo, DTYPE), np.asarray(self._q_hi, DTYPE)
-        else:
-            # The SDK's reported range is per joint, in radians when is_radian.
-            lim = np.asarray(arm.joint_limits or [], dtype=DTYPE)
-            if lim.shape != (self.n_joints, 2):
+        # What this SDK actually reports about the machine (verified against
+        # SDK 1.18.4 source on the rig): `axis` and `joint_speed_limit`
+        # ([min, max], radians/s under is_radian).  It does NOT report
+        # per-joint angle ranges -- an earlier version of this method read
+        # `arm.joint_limits`, an attribute that does not exist, and fell over
+        # on first hardware contact.  Angle ranges come from the cell's URDF,
+        # which is the calibrated master and already tightened against this
+        # serial's firmware limits.
+        n_hw = int(getattr(arm, "axis", 0) or 0)
+        if n_hw and n_hw != self.n_joints:
+            raise RuntimeError(
+                f"{self.name}: controller reports {n_hw} axes, configured "
+                f"{self.n_joints}"
+            )
+        if self._q_lo is None or self._q_hi is None:
+            raise RuntimeError(
+                f"{self.name}: this SDK does not report per-joint angle ranges; "
+                "pass q_lo/q_hi from the cell's URDF"
+            )
+        lo, hi = np.asarray(self._q_lo, DTYPE), np.asarray(self._q_hi, DTYPE)
+        sl = getattr(arm, "joint_speed_limit", None)
+        if self._qd_max is not None:
+            qd_max = np.asarray(self._qd_max, DTYPE)
+            if sl and np.any(qd_max > float(sl[1]) + 1e-6):
                 raise RuntimeError(
-                    f"{self.name}: the SDK reported joint limits of shape {lim.shape}; "
-                    "pass q_lo/q_hi explicitly from the cell's URDF instead"
+                    f"{self.name}: configured velocity limit "
+                    f"{float(qd_max.max()):.2f} rad/s exceeds the controller's "
+                    f"own ceiling {float(sl[1]):.2f} rad/s"
                 )
-            lo, hi = lim[:, 0], lim[:, 1]
-        qd_max = (
-            np.asarray(self._qd_max, DTYPE)
-            if self._qd_max is not None
-            else np.full(self.n_joints, DTYPE(3.14))
-        )
+        else:
+            qd_max = np.full(self.n_joints, DTYPE(float(sl[1]) if sl else 3.14))
         return UnitLimits(
             n_joints=self.n_joints,
             q_lo=lo,
