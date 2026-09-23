@@ -21,7 +21,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import yaml
@@ -39,9 +39,43 @@ _SUPPORTED_MAJORS = ("1",)
 
 _PRIMITIVE_TYPES = ("plane", "box", "sphere", "cylinder")
 
+#: A mesh obstacle is PARSED AND CARRIED here, and collided against nowhere.
+#:
+#: corner_cell -- the real Siemens rig cell, measured 2026-09-23 -- describes its
+#: surroundings as one STL (`meshes/cell_obstacles.stl`, scale 0.001) because a
+#: corner of a room is not a handful of boxes.  This loader used to raise on
+#: `type: mesh`, and the consequence was not "no mesh collision": it was that the
+#: whole measured cell could not be loaded by ANY part of this package, including
+#: scripts/sysid_tapes.py, which reads joints and rates and never looks at the
+#: environment at all.  That is refusing in the wrong place.  The layers that lack
+#: the capability are the collision builders, and they now refuse by name -- see
+#: `refuse_mesh_obstacles`.
+_MESH_TYPE = "mesh"
+
+#: Every `environment[].type` this loader accepts.  A mesh is accepted by the
+#: SCHEMA and rejected by the COLLISION layer; those are different doors.
+_ENV_TYPES = (*_PRIMITIVE_TYPES, _MESH_TYPE)
+
 
 class CellSpecError(ValueError):
     """Raised when a cell file does not satisfy the contract."""
+
+
+class MeshCollisionUnsupported(CellSpecError):
+    """A collision consumer was handed a mesh obstacle.  lc cannot collide with one.
+
+    Its own exception type, for the same reason `RateMismatch` is: the failure it
+    reports is NOT a malformed file.  The cell is right -- the mesh is what the
+    installer measured -- and it is this package that is missing a capability.  A
+    caller that can proceed without an environment (sysid, kinematics, limits,
+    tape replay) should never see this; a caller that is building a collision
+    world must see it rather than a collision world with a hole in it.
+
+    It subclasses CellSpecError so existing `except CellSpecError` handlers keep
+    catching it, and CellSpecError is a ValueError, so the older
+    `raise ValueError("unknown primitive type ...")` contract in
+    reference/walls.py is preserved for callers that catch that.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +139,73 @@ class EnvPrimitive:
     dims: np.ndarray  # box: half-extents; sphere: [r]; cylinder: [r, half-height]
 
 
+@dataclass(frozen=True)
+class EnvMesh:
+    """A static environment obstacle given as a mesh file, in world coordinates.
+
+    Deliberately NOT an `EnvPrimitive` and deliberately WITHOUT a `dims` field.
+    A mesh that carried `dims` could be read by primitive code by accident, and
+    the accident is not a crash -- it is a box of half-extents [0, 0, 0] quietly
+    joining the planner's obstacle set.  With no `dims` at all, primitive code
+    either dispatches on `ptype` (and is made to refuse: see
+    `refuse_mesh_obstacles`) or raises AttributeError.  Neither is silent.
+
+    `mesh_path` is resolved against the cell file's directory at load, like every
+    other path in the contract, and its existence is checked there: an obstacle
+    carried as a path that points at nothing is not a carried measurement.
+    """
+
+    name: str
+    pose: np.ndarray  # 4x4, world -> mesh origin
+    mesh_path: Path  # absolute, resolved against the cell file's directory
+    scale: np.ndarray  # (3,) per-axis multiplier on the file's own units
+    #: A ClassVar, not a field, so `EnvMesh(..., ptype="box")` is impossible while
+    #: `obstacle.ptype` still answers for both kinds (config_stamp reads it).
+    ptype: ClassVar[str] = _MESH_TYPE
+
+
+#: Anything that can appear in `CellSpec.environment`.
+EnvObstacle = EnvPrimitive | EnvMesh
+
+
+def refuse_mesh_obstacles(environment: tuple[EnvObstacle, ...], *, consumer: str) -> None:
+    """Refuse, by name, if `environment` contains a mesh.  Call this at the door.
+
+    Every layer that BUILDS OR CONSULTS collision geometry calls this before it
+    builds anything, because the alternative is silent in exactly the case that
+    matters.  corner_cell declares one mesh obstacle and no `spheres:` file, so
+    the environment row loops produce zero rows with or without a mesh: the
+    caller would be handed a pair list that looks complete while nothing about
+    the environment had been checked at all.
+
+    ⚠ This is unconditional -- `collision: {environment: false}` does not make a
+    mesh acceptable here.  The reason is `kernels/structure.py`: it flattens
+    every obstacle into an `env_type` code and uploads the array whole, and
+    `warp_backend.env_distance` dispatches on that code with the CYLINDER branch
+    as its fall-through, so there is no value on earth that can stand for a mesh
+    in that array -- a placeholder becomes a phantom degenerate cylinder at the
+    mesh's pose, inside the QP, on the device, where nothing can raise.  One
+    unconditional rule at four doors beats a flag that means something different
+    on the reference path than on the kernel path.
+    """
+    for obstacle in environment:
+        if isinstance(obstacle, EnvMesh):
+            raise MeshCollisionUnsupported(
+                f"{consumer}: cannot build collision geometry for environment obstacle "
+                f"{obstacle.name!r} -- it is a MESH ({obstacle.mesh_path}), and "
+                "remoroo-lc has no mesh collision support.  Its collision world is "
+                f"spheres against primitives only ({', '.join(_PRIMITIVE_TYPES)}), on "
+                "the reference path (remoroo_lc/reference/walls.py) and in the Warp "
+                "kernels (remoroo_lc/kernels/warp_backend.py) alike.  Either declare "
+                "this obstacle as those primitives in the cell's `environment:` list, "
+                "or use a path that does not consult the environment -- load_cell, "
+                "validate_cell, KinematicTree and scripts/sysid_tapes.py all carry a "
+                "mesh obstacle untouched.  lc will not substitute a box: an invented "
+                "box is a phantom obstacle in the planner, which is worse than this "
+                "refusal."
+            )
+
+
 @dataclass
 class CellSpec:
     """A fully resolved, validated cell."""
@@ -114,7 +215,7 @@ class CellSpec:
     source: Path
     models: tuple[ModelSpec, ...]
     tcps: tuple[TcpSpec, ...]
-    environment: tuple[EnvPrimitive, ...]
+    environment: tuple[EnvObstacle, ...]
     collision: dict[str, Any]
     limits: dict[str, Any]
     gains: dict[str, Any]
@@ -387,11 +488,67 @@ def load_spheres(path: str | Path) -> dict[str, list[tuple[np.ndarray, float]]]:
     return out
 
 
-def _env_primitive(entry: dict[str, Any], i: int) -> EnvPrimitive:
+def _env_obstacle(entry: dict[str, Any], i: int, base_dir: Path) -> EnvObstacle:
+    """Parse one `environment[]` entry.  The only place the accepted types are decided."""
     where = f"environment[{i}]"
     ptype = entry.get("type")
-    if ptype not in _PRIMITIVE_TYPES:
-        raise CellSpecError(f"{where}: type must be one of {_PRIMITIVE_TYPES}, got {ptype!r}")
+    if ptype not in _ENV_TYPES:
+        raise CellSpecError(f"{where}: type must be one of {_ENV_TYPES}, got {ptype!r}")
+    if ptype == _MESH_TYPE:
+        return _env_mesh(entry, i, base_dir)
+    return _env_primitive(entry, i)
+
+
+def _env_mesh(entry: dict[str, Any], i: int, base_dir: Path) -> EnvMesh:
+    """Parse a `type: mesh` obstacle: file, scale and 4x4 pose, carried verbatim.
+
+    Both `file` and `scale` are REQUIRED, and `scale` is required for a reason
+    that cost real corner geometry: an STL carries no units.  corner_cell's
+    obstacle mesh is authored in millimetres and declared `scale: [0.001, 0.001,
+    0.001]`; defaulting a missing scale to 1.0 would be inventing a number, and
+    the number it invents is wrong by 1000x -- an obstacle the size of a building
+    around a 0.8 m cell.  An absent measurement must fail, not be guessed.
+    """
+    where = f"environment[{i}]"
+    name = entry.get("name", f"env{i}")
+    if not entry.get("file"):
+        raise CellSpecError(
+            f"{where}: a mesh obstacle needs `file:`, the path to the mesh, resolved "
+            "against the cell file's directory"
+        )
+    mesh_path = _resolve(base_dir, str(entry["file"]))
+    if not mesh_path.is_file():
+        raise CellSpecError(
+            f"{where}: mesh file {mesh_path} does not exist.  Nothing in lc opens this "
+            "file -- it is carried for the consumers that do -- which is exactly why it "
+            "is checked here: a broken path in a carried measurement would otherwise "
+            "surface only downstream, in whatever tool finally tried to load the cell's "
+            "obstacle world"
+        )
+    if "scale" not in entry:
+        raise CellSpecError(
+            f"{where}: a mesh obstacle needs an explicit `scale:` (3 entries).  A mesh "
+            "file has no units, so there is no safe default: millimetres vs metres is a "
+            "1000x error in the position AND the size of the obstacle.  Write "
+            "[1.0, 1.0, 1.0] if the file is already in metres"
+        )
+    scale = np.asarray(entry["scale"], dtype=DTYPE)
+    if scale.shape != (POINT_DIM,):
+        raise CellSpecError(f"{where}: mesh scale must have {POINT_DIM} entries")
+    if not bool(np.all(scale > 0.0)):
+        raise CellSpecError(
+            f"{where}: mesh scale must be positive on every axis, got {scale.tolist()}"
+        )
+    return EnvMesh(
+        name=name, pose=_pose_from(entry, where), mesh_path=mesh_path, scale=scale
+    )
+
+
+def _env_primitive(entry: dict[str, Any], i: int) -> EnvPrimitive:
+    # `_env_obstacle` has already checked that `type` is one of _PRIMITIVE_TYPES;
+    # this function is not a second door and must not grow one.
+    where = f"environment[{i}]"
+    ptype = entry["type"]
     name = entry.get("name", f"env{i}")
     if ptype == "plane":
         normal = np.asarray(entry.get("normal", [0.0, 0.0, 1.0]), dtype=DTYPE)
@@ -619,7 +776,7 @@ def load_cell(
         )
 
     environment = tuple(
-        _env_primitive(e, i) for i, e in enumerate(raw.get("environment") or [])
+        _env_obstacle(e, i, base_dir) for i, e in enumerate(raw.get("environment") or [])
     )
 
     collision = {
@@ -711,6 +868,14 @@ def validate_cell(cell: CellSpec) -> None:
         bad = [labels[i] for i in np.concatenate([below, above])]
         raise CellSpecError(f"{cell.name}: rest posture outside joint limits for {bad}")
 
+    # A mesh obstacle is VALID cell content and is not refused here: a validator
+    # that rejected it would put this package's missing capability in front of the
+    # installer's measurement, and would keep the whole cell -- joints, TCPs,
+    # rates, limits -- out of reach of every consumer that never touches the
+    # environment.  The collision builders refuse it by name instead; see
+    # `refuse_mesh_obstacles`.  This loop is still the door for a CellSpec that
+    # was hand-built rather than loaded (validate_cell is exported for exactly
+    # that, so `remoroo setup` can check what it emits before shipping it).
     for prim in cell.environment:
-        if prim.ptype not in _PRIMITIVE_TYPES:
+        if prim.ptype not in _ENV_TYPES:
             raise CellSpecError(f"{cell.name}: unknown environment type {prim.ptype!r}")

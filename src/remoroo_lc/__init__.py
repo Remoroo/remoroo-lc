@@ -20,8 +20,11 @@ Public entry points:
 from remoroo_lc.constants import DTYPE, TASK_DIM
 from remoroo_lc.schema import (
     CellSpec,
+    CellSpecError,
     EffectorSpec,
+    EnvMesh,
     EnvPrimitive,
+    MeshCollisionUnsupported,
     ModelSpec,
     TcpSpec,
     load_cell,
@@ -31,11 +34,14 @@ from remoroo_lc.schema import (
 
 __all__ = [
     "CellSpec",
+    "CellSpecError",
     "Controller",
     "DTYPE",
     "EffectorSpec",
+    "EnvMesh",
     "EnvPrimitive",
     "KinematicTree",
+    "MeshCollisionUnsupported",
     "ModelSpec",
     "Plant",
     "TASK_DIM",

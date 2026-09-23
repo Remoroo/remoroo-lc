@@ -21,7 +21,12 @@ import numpy as np
 from remoroo_lc.constants import DTYPE, POINT_DIM, TASK_DIM
 from remoroo_lc.reference.kinematics import KinematicTree
 from remoroo_lc.reference.walls import WallBuilder
-from remoroo_lc.schema import CellSpec, RateMismatch, resolve_rates
+from remoroo_lc.schema import (
+    CellSpec,
+    RateMismatch,
+    refuse_mesh_obstacles,
+    resolve_rates,
+)
 
 # Environment primitive type codes, shared with the kernels.
 ENV_PLANE = 0
@@ -30,6 +35,13 @@ ENV_SPHERE = 2
 ENV_CYLINDER = 3
 
 _ENV_CODE = {"plane": ENV_PLANE, "box": ENV_BOX, "sphere": ENV_SPHERE, "cylinder": ENV_CYLINDER}
+# ⚠ There is no code in here for a mesh, and none can be added without mesh
+# collision in the kernels.  `warp_backend.env_distance` dispatches on this code
+# and its LAST branch is the fall-through, so an unrecognised code is computed as
+# a cylinder: a placeholder for a mesh would upload a degenerate cylinder at the
+# mesh's pose and the QP would steer around an obstacle that does not exist.
+# `build_structure` therefore refuses a mesh on the host, before any of this is
+# built -- a device kernel has no way to raise.
 
 
 @dataclass
@@ -204,6 +216,14 @@ def build_structure(
     caller believes it will drive this controller at and `resolve_rates` raises
     if the cell disagrees.  See `schema.resolve_rates` for why the cell wins.
     """
+    # FIRST, before a single array exists.  This is the door of the layer that
+    # flattens the obstacle world for the kernels, and it is one of the four
+    # places a mesh obstacle can enter the collision path; the others are
+    # `walls.build_pair_list` (reached from here and from `WallBuilder`, which
+    # `Controller` builds without ever calling this function) and
+    # `walls.env_distance` / `env_distance_batch`.  See `_ENV_CODE` above for why
+    # there is nothing this function could put in `env_type` instead.
+    refuse_mesh_obstacles(cell.environment, consumer="kernels.structure.build_structure")
     tree = KinematicTree(cell)
     walls = WallBuilder(cell, tree)
     lim = cell.limits

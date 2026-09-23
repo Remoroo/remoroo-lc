@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -88,3 +89,54 @@ def run_closed_loop(cell, controller, plant, chunks, steps_per_chunk: int):
             q, _ = plant.step(out.q_target)
             records.append(out)
     return records, q
+
+
+def write_cell(tmp_dir, base_path: Path, mutate) -> Path:
+    """Copy a shipped cell into `tmp_dir`, apply `mutate` to its raw dict, write it.
+
+    Every relative path inside the cell (urdf, spheres, limits, gains) is
+    absolutised against the ORIGINAL file's directory first, because the copy
+    lands in a tmp directory where `../arm.urdf` means nothing.  This is the same
+    trick `test_schema._write` plays; it lives here because the environment tests
+    need it too and two copies of a path-rewriting rule is one copy too many.
+    """
+    raw = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    mutate(raw)
+    for m in raw.get("models", []):
+        for key in ("urdf", "spheres"):
+            if key in m and not str(m[key]).startswith("/"):
+                m[key] = str((base_path.parent / m[key]).resolve())
+    for key in ("limits", "gains"):
+        if isinstance(raw.get(key), str):
+            raw[key] = str((base_path.parent / raw[key]).resolve())
+    out = Path(tmp_dir) / "cell.yaml"
+    out.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return out
+
+
+#: One environment entry of EVERY primitive type the loader accepts.  No shipped
+#: cell declares a sphere or a cylinder -- `configs/cells/*.yaml` between them use
+#: only `plane` and `box` -- so without this literal two of the four encodings in
+#: `structure._ENV_CODE` and two of the four branches in `walls.env_distance` are
+#: never exercised by a cell-level test.  The numbers are arbitrary but FIXED:
+#: tests/test_env_mesh.py pins the structure they flatten to, so changing one of
+#: them here is a deliberate act that will fail that test.
+PRIMITIVE_ENVIRONMENT = [
+    {"name": "table", "type": "plane", "point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+    {
+        "name": "back_wall",
+        "type": "box",
+        "xyz": [-0.50, 0.0, 0.75],
+        "rpy": [0.0, 0.0, 0.0],
+        "dims": [0.06, 2.00, 1.50],
+    },
+    {"name": "bulb", "type": "sphere", "xyz": [0.20, 0.10, 0.40], "radius": 0.05},
+    {
+        "name": "post",
+        "type": "cylinder",
+        "xyz": [0.0, 0.30, 0.50],
+        "rpy": [0.1, -0.2, 0.3],
+        "radius": 0.05,
+        "height": 1.00,
+    },
+]

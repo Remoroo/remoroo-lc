@@ -26,7 +26,7 @@ import numpy as np
 
 from remoroo_lc.constants import BIG, DTYPE, EPS, POINT_DIM
 from remoroo_lc.reference.kinematics import FkResult, KinematicTree
-from remoroo_lc.schema import CellSpec, EnvPrimitive
+from remoroo_lc.schema import CellSpec, EnvObstacle, refuse_mesh_obstacles
 
 PAIR_ROBOT_ROBOT = 0
 PAIR_ROBOT_ENV = 1
@@ -235,6 +235,18 @@ def group_pairs_by_link(
 
 def build_pair_list(cell: CellSpec, tree: KinematicTree, spheres: SphereSet) -> PairList:
     """Resolve the fixed collision-pair list for this cell."""
+    # ⚠ Before a single pair is decided, because the failure this prevents is
+    # SILENT rather than loud.  corner_cell (Siemens rig, measured 2026-09-23)
+    # declares one mesh obstacle and no `spheres:` file at all, so the
+    # environment loop below emits zero rows whether or not the obstacle is
+    # something this package can collide with -- the caller gets a pair list that
+    # looks complete and an environment that was never checked.  Refusing here
+    # also covers the two loops downstream that consume this list and cannot be
+    # reached without it: `WallBuilder.__init__`'s `_env_rows` partition and
+    # `WallBuilder.assemble`'s per-primitive row block (which additionally hits
+    # `env_distance_batch`'s own refusal).  No gate is placed in those two: a gate
+    # that cannot fire is not a gate.
+    refuse_mesh_obstacles(cell.environment, consumer="reference.walls.build_pair_list")
     n_s = len(spheres)
     model_of: list[str] = []
     link_of: list[str] = []
@@ -316,8 +328,9 @@ def build_pair_list(cell: CellSpec, tree: KinematicTree, spheres: SphereSet) -> 
 # --------------------------------------------------------------------------- #
 
 
-def env_distance_batch(prim: EnvPrimitive, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def env_distance_batch(prim: EnvObstacle, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Vectorised `env_distance` over (S, 3) points.  Returns (d (S,), n (S, 3))."""
+    refuse_mesh_obstacles((prim,), consumer="reference.walls.env_distance_batch")
     n_pts = P.shape[0]
     if n_pts == 0:
         return np.zeros(0, dtype=DTYPE), np.zeros((0, POINT_DIM), dtype=DTYPE)
@@ -391,9 +404,16 @@ def env_distance_batch(prim: EnvPrimitive, P: np.ndarray) -> tuple[np.ndarray, n
     raise ValueError(f"unknown primitive type {prim.ptype!r}")
 
 
-def env_distance(prim: EnvPrimitive, p: np.ndarray) -> tuple[float, np.ndarray]:
+def env_distance(prim: EnvObstacle, p: np.ndarray) -> tuple[float, np.ndarray]:
     """Signed distance from a point to a primitive's surface, and the outward
-    unit normal at the closest point (pointing from the primitive to the point)."""
+    unit normal at the closest point (pointing from the primitive to the point).
+
+    A mesh obstacle is refused here by name rather than falling through to the
+    `unknown primitive type` raise at the bottom: "unknown type 'mesh'" reads as a
+    typo in a cell file, when what actually happened is that a caller asked this
+    layer for a capability it does not have.
+    """
+    refuse_mesh_obstacles((prim,), consumer="reference.walls.env_distance")
     if prim.ptype == "plane":
         n = prim.dims  # normal was stashed in dims by the loader
         d = float(np.dot(n, p - prim.pose[:POINT_DIM, POINT_DIM]))

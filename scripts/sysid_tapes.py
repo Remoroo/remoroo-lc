@@ -14,6 +14,14 @@ controller sits on top of.
 
     python scripts/sysid_tapes.py configs/cells/dual_xarm6.yaml            # self-check
     python scripts/sysid_tapes.py configs/cells/dual_xarm6.yaml --out g.yaml
+    python scripts/sysid_tapes.py ~/cell/lc/cell.yaml --hardware --hosts <ips> --go \
+        --gains configs/gains.default.yaml --out /tmp/gains_raw.yaml
+
+The fit takes inertia as an INPUT (it identifies kp/M and kd/M, never M itself),
+which is what --gains supplies; --out is where the measurement goes.  On a rig
+cell the two cannot be the same file: the cell's `gains:` has to name the measured
+file the control stack reads afterwards, and that file does not exist yet on the
+session that is about to create it.
 
 Self-check is the default and is what the test runs: excite the reference plant
 with known gains and confirm the fit recovers them.  A fitter that has never been
@@ -544,9 +552,25 @@ def main() -> int:
     ap.add_argument("--joints", default=None,
                     help="comma-separated joint labels to identify (default: all); "
                          "a first hardware session probes ONE joint")
+    ap.add_argument(
+        "--gains", type=Path, default=None,
+        help="gains yaml supplying the fit's INPUT -- the by_kind inertia prior -- "
+             "overriding whatever the cell file declares.  NOT the output: the "
+             "measurement goes to --out.",
+    )
     a = ap.parse_args()
 
-    cell = load_cell(a.cell)
+    # ⚠ --gains is the fit's INPUT and it exists to break a chicken-and-egg.  A
+    # rig cell's `gains:` must name the MEASURED file (cells/<id>/lc/gains.yaml --
+    # that is what the control stack reads after this session), but load_cell
+    # opens whatever `gains:` names eagerly, so before the first session the cell
+    # this session is FOR cannot be loaded at all: FileNotFoundError, zero joints
+    # measured, and the operator standing at the E-stop for nothing.  Passing
+    # gains_path short-circuits that branch in load_cell, which is why the
+    # override works when the cell's own target is ABSENT -- the path is never
+    # opened.  The fit needs only inertia out of this file (see the by_kind lookup
+    # below); kp and kd in it are the reference plant's business, not the rig's.
+    cell = load_cell(a.cell, gains_path=a.gains)
     joints = None
     if a.joints:
         labels = cell.joint_labels()
@@ -568,8 +592,25 @@ def main() -> int:
                 "stand at the E-stop, and pass --go deliberately"
             )
         adapter = HardwareCell(cell, hosts)
-        adapter.connect()
-        try:
+    else:
+        from remoroo_lc.adapters.mock import MockCellAdapter
+
+        adapter = MockCellAdapter(cell)
+
+    adapter.connect()
+    # ⚠ EVERYTHING between connect() and this finally has to stay inside it.
+    # This try used to begin below, and the setup in between -- the amplitude
+    # clip, joint_velocity_limits(), KinematicTree(cell), the by_kind/inertia
+    # lookup and the header print -- ran with NO handler at all.  A CellSpecError
+    # out of joint_velocity_limits(), a kinematics failure, or a
+    # `KeyError: 'revolute'` from a gains file with no by_kind table therefore
+    # exited main() with both controllers still energised in servo mode with
+    # motion enabled and nothing cleaning up after them: exactly the fault
+    # connect() (~line 287) says "never again" about, reintroduced 300 lines
+    # later in the caller.  What was missing is the cleanup, not the guards, so
+    # not one guard changed -- they raise inside the protection now.
+    try:
+        if a.hardware:
             q_now, _ = adapter._read()
             if a.at_cell_rest:
                 far = float(np.max(np.abs(q_now - cell.rest_posture())))
@@ -579,47 +620,39 @@ def main() -> int:
                 _use_current_pose_as_rest(cell, q_now)
                 print("  [hw] excitations anchored at the CURRENT pose; "
                       f"q = {np.array2string(q_now, precision=3)}")
-        except BaseException:
-            adapter.disconnect()
-            raise
-        scale = float(np.clip(a.amplitude_scale, 0.05, 1.0))
-        hz = float(cell.limits["rates"]["command_hz"])
-        qd_max = cell.joint_velocity_limits()
+            scale = float(np.clip(a.amplitude_scale, 0.05, 1.0))
+            hz = float(cell.limits["rates"]["command_hz"])
+            qd_max = cell.joint_velocity_limits()
 
-        def hw_tapes(j: int):
-            amp_c = 0.08 * scale
-            # cap the chirp's top frequency so the commanded velocity never
-            # exceeds a third of the joint's own limit: 2*pi*f1*A <= qd_max/3
-            f1 = float(min(10.0, qd_max[j] / (3.0 * 2.0 * np.pi * amp_c)))
-            print(f"  [hw] joint {j}: step 0.15*{scale:.2f} rad ramped 0.12 s, "
-                  f"chirp {amp_c:.3f} rad 0.2->{f1:.1f} Hz")
-            return (
-                step_tape(cell, j, amplitude=0.15 * scale,
-                          ramp_ticks=int(0.12 * hz)),
-                chirp_tape(cell, j, amplitude=amp_c, f1=f1),
-            )
+            def hw_tapes(j: int):
+                amp_c = 0.08 * scale
+                # cap the chirp's top frequency so the commanded velocity never
+                # exceeds a third of the joint's own limit: 2*pi*f1*A <= qd_max/3
+                f1 = float(min(10.0, qd_max[j] / (3.0 * 2.0 * np.pi * amp_c)))
+                print(f"  [hw] joint {j}: step 0.15*{scale:.2f} rad ramped 0.12 s, "
+                      f"chirp {amp_c:.3f} rad 0.2->{f1:.1f} Hz")
+                return (
+                    step_tape(cell, j, amplitude=0.15 * scale,
+                              ramp_ticks=int(0.12 * hz)),
+                    chirp_tape(cell, j, amplitude=amp_c, f1=f1),
+                )
 
-        tapes_for = hw_tapes
-    else:
-        from remoroo_lc.adapters.mock import MockCellAdapter
+            tapes_for = hw_tapes
+        else:
+            tapes_for = None
+        tree = KinematicTree(cell)
+        by_kind = cell.gains.get("by_kind", {})
+        inertia = np.asarray(
+            [
+                by_kind[{KIND_REVOLUTE: "revolute", KIND_PRISMATIC: "prismatic"}[int(k)]]["inertia"]
+                for k in tree.joint_kind
+            ],
+            dtype=float,
+        )
 
-        adapter = MockCellAdapter(cell)
-        adapter.connect()
-        tapes_for = None
-    tree = KinematicTree(cell)
-    by_kind = cell.gains.get("by_kind", {})
-    inertia = np.asarray(
-        [
-            by_kind[{KIND_REVOLUTE: "revolute", KIND_PRISMATIC: "prismatic"}[int(k)]]["inertia"]
-            for k in tree.joint_kind
-        ],
-        dtype=float,
-    )
-
-    n_id = cell.n_joints if joints is None else len(joints)
-    print(f"{cell.name}: identifying {n_id} joints"
-          + (" ON HARDWARE" if a.hardware else ""))
-    try:
+        n_id = cell.n_joints if joints is None else len(joints)
+        print(f"{cell.name}: identifying {n_id} joints"
+              + (" ON HARDWARE" if a.hardware else ""))
         if a.hardware:
             fits = identify_hw(cell, adapter, inertia, tapes_for, joints)
         else:
@@ -633,8 +666,25 @@ def main() -> int:
         "plant_rate_hz": cell.gains.get("plant_rate_hz", 1000),
         "command_delay_ticks": int(max(delays)),
         "by_kind": by_kind,
+        # `residual` and `delay_ticks` are per-joint EVIDENCE, and they used to be
+        # printed to the operator's terminal and then dropped on the floor: a
+        # garbage fit and a clean one wrote indistinguishable files, and the
+        # 2026-08-30 rig file (cells/robot_setup_3/lc/gains.yaml) carries twelve
+        # kp/kd pairs with no way left to ask how well any of them fitted, or
+        # which joints disagreed about the delay that command_delay_ticks above
+        # collapses to its maximum.  residual is the mean squared error of
+        # fit_joint's least-squares solve at the winning delay (units: N^2, so it
+        # is comparable across joints only through this file's own inertias);
+        # delay_ticks is THIS joint's fitted delay in command ticks.
+        # ⚠ Added keys only, never renamed or reshaped: engine/rigmeas/wrap_gains.py
+        # and engine/convert/actuators_from_sysid.py read inertia/kp/kd out of
+        # these same per_joint entries, and wrap_gains decides inertia's gauge by
+        # comparing it against by_kind above.
         "per_joint": {
-            k: {"inertia": v["inertia"], "kp": v["kp"], "kd": v["kd"]} for k, v in fits.items()
+            k: {"inertia": v["inertia"], "kp": v["kp"], "kd": v["kd"],
+                "delay_ticks": int(v["delay_ticks"]),
+                "residual": float(v["residual"])}
+            for k, v in fits.items()
         },
     }
     if len(delays) > 1:
@@ -643,7 +693,13 @@ def main() -> int:
             "model carries one delay for the whole cell, so the largest is used"
         )
     if a.out:
-        a.out.write_text(yaml.safe_dump(doc, sort_keys=False))
+        # ⚠ mkdir before write: write_text does NOT create parents, and the only
+        # thing standing between a 25-minute commanded-motion session and a
+        # FileNotFoundError that throws away every number it measured was the
+        # operator having happened to name a directory that already existed.  An
+        # engine phase writing into a per-run artifact directory does not.
+        a.out.parent.mkdir(parents=True, exist_ok=True)
+        a.out.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
         print(f"wrote {a.out}")
     return 0
 

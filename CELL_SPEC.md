@@ -96,6 +96,14 @@ environment:               # optional
   - { name: wall, type: box, xyz: [-0.5, 0, 0.75], rpy: [0, 0, 0], dims: [0.06, 2.0, 1.5] }
   - { name: bulb, type: sphere, xyz: [0.2, 0, 0.4], radius: 0.05 }
   - { name: post, type: cylinder, xyz: [0, 0.3, 0.5], rpy: [0, 0, 0], radius: 0.05, height: 1.0 }
+  - name: cell_obstacles   # CARRIED, NOT COLLIDED -- see below
+    type: mesh
+    file: ../meshes/cell_obstacles.stl   # REQUIRED, resolved like every other path,
+                                         #   and its existence is checked at load
+    scale: [0.001, 0.001, 0.001]         # REQUIRED, 3 entries, positive.  A mesh file
+                                         #   has no units; there is no safe default
+    xyz: [-0.236, 0.472, -0.054]
+    quat: [0.70710678, 0, 0, -0.70710678] # OR rpy -- not both
 
 collision:                 # optional; defaults shown
   self_pairs: true         # check sphere pairs within each model
@@ -104,6 +112,31 @@ collision:                 # optional; defaults shown
   ignore_pairs: []         # [[linkA, linkB], ...] -- see section 5
   max_pairs: null          # hard cap; exceeding it is an ERROR, never a silent truncation
 ```
+
+### `type: mesh` is carried, not collided against
+
+remoroo-lc has **no mesh collision**: its collision world is spheres against
+`plane` / `box` / `sphere` / `cylinder`, in the reference path and in the Warp
+kernels alike. A mesh obstacle is nonetheless a measurement of the real cell --
+corner_cell describes its surroundings as one STL, which is a truer description
+of a corner of a room than a handful of boxes -- so the **schema carries it**
+(`EnvMesh`: resolved `mesh_path`, `scale`, 4x4 `pose`) and the **collision layer
+refuses it by name**:
+
+| caller | mesh obstacle in `environment:` |
+| --- | --- |
+| `load_cell`, `validate_cell`, `config_stamp` | loads; the mesh is carried whole |
+| `KinematicTree`, `Plant`, tapes, `scripts/sysid_tapes.py` | unaffected; never consult the environment |
+| `kernels.structure.build_structure` | raises `MeshCollisionUnsupported` |
+| `reference.walls.build_pair_list`, and so `WallBuilder` and `Controller` | raises `MeshCollisionUnsupported` |
+| `reference.walls.env_distance` / `env_distance_batch` | raises `MeshCollisionUnsupported` |
+
+The refusal is unconditional: `collision: {environment: false}` does not make a
+mesh acceptable to those callers, because `build_structure` has to put a type
+code in its `env_type` array for every obstacle and the kernels' `env_distance`
+treats an unrecognised code as a **cylinder** -- any placeholder would be a
+phantom obstacle in the QP. To drive a cell whose obstacles are a mesh, declare
+the obstacles as primitives; nothing in lc will approximate them for you.
 
 ## 4. URDF
 
