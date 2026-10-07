@@ -314,6 +314,10 @@ class _FakeHardwareCell:
 
     def __init__(self, cell, hosts) -> None:
         self.cell, self.hosts, self.log = cell, hosts, []
+        # the session surface main() reads (2026-10-07): one slice per host
+        per = cell.n_joints // len(hosts)
+        self.slices = [slice(i * per, (i + 1) * per) for i in range(len(hosts))]
+        self.qdd_max, self.only_unit, self.motion_s = 20.0, None, 0.0
 
     def connect(self) -> None:
         self.log.append("connect")
@@ -348,7 +352,7 @@ def test_a_failure_between_connect_and_identify_still_disconnects(monkeypatch, i
     m = _sysid()
     built: list[_FakeHardwareCell] = []
 
-    def build(cell, hosts):
+    def build(cell, hosts, *_unit, **_kw):   # (cell, hosts, unit, gripper=)
         built.append(_FakeHardwareCell(cell, hosts))
         return built[-1]
 
@@ -418,7 +422,7 @@ def test_gains_override_needs_only_inertia_on_the_hardware_path(tmp_path, monkey
 
     built: list[_FakeHardwareCell] = []
 
-    def build(cell, hosts):
+    def build(cell, hosts, *_unit, **_kw):   # (cell, hosts, unit, gripper=)
         built.append(_FakeHardwareCell(cell, hosts))
         return built[-1]
 
@@ -426,14 +430,14 @@ def test_gains_override_needs_only_inertia_on_the_hardware_path(tmp_path, monkey
 
     handed = {}
 
-    def fake_identify_hw(cell, adapter, inertia, tapes_for, joints, verbose=True):
+    def fake_identify_hw(cell, adapter, inertia, *, joints, **_kw):
         handed["inertia"] = np.asarray(inertia, dtype=float).copy()
         labels = cell.joint_labels()
         return {
             labels[j]: {"inertia": float(inertia[j]), "kp": 1.0, "kd": 1.0,
                         "delay_ticks": 3, "residual": 0.5}
             for j in joints
-        }
+        }, {"tape_pose": {}, "tapes": [], "raw_files": []}
 
     monkeypatch.setattr(m, "identify_hw", fake_identify_hw)
 

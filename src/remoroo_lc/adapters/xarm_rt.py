@@ -59,12 +59,26 @@ class RtSample:
     q: np.ndarray  # (n_joints,) rad
     qd: np.ndarray  # (n_joints,) rad/s
     tau: np.ndarray  # (n_joints,) N.m
+    #: The controller's own TARGET joint position (offset 32), i.e. the servo_j
+    #: target it is executing at this frame.  Against the host's send stamps it
+    #: shows when a target was ACCEPTED, which splits the fitted 20-28 ms command
+    #: delay into transport (send -> q_target) and servo lag (q_target -> q);
+    #: docs/2026-10-07_motor_sysid_vs_sota.md row 9 in remoroo-world.  Same offset
+    #: and unit (rad, 7 x f32 LE) as remoroo-world deploy/edge_student/transport/
+    #: frame.py (OFF_Q_TARGET = 32, "TARGET joint position rad").
+    q_target: np.ndarray  # (n_joints,) rad
     tcp_xyz: np.ndarray  # (3,) metres
     #: Orientation as a ROTATION VECTOR (axis * angle), NOT roll-pitch-yaw.  The
     #: vendor table says only "rad"; read as RPY it is 40 deg wrong, read as a
     #: rotation vector it agrees with the SDK's own pose to 0.19 deg.  Measured on
     #: the rig, both ways, because the difference is invisible until it is not.
     tcp_rotvec: np.ndarray  # (3,) rad
+    #: ⚠ Decoded per the vendor table, but on corner_cell's two controllers every
+    #: byte from 544 to 783 is ZERO in every frame measured (remoroo-world
+    #: deploy/edge_student/transport/frame.py, TRAP 1), so this is a constant 0.0
+    #: there, not a jaw reading.  The live source is the SDK's
+    #: get_gripper_position on the tool bus; scripts/sysid_tapes.py --gripper
+    #: polls that and records NaN from this field.
     gripper_pos_mm: float
     gripper_state: int
 
@@ -134,6 +148,7 @@ class XArmRealTime:
         q = np.asarray(struct.unpack_from(f"<{_N_JOINT_SLOTS}f", f, OFF_ACTUAL_Q)[:n])
         qd = np.asarray(struct.unpack_from(f"<{_N_JOINT_SLOTS}f", f, OFF_ACTUAL_QD)[:n])
         tau = np.asarray(struct.unpack_from(f"<{_N_JOINT_SLOTS}f", f, OFF_ACTUAL_TAU)[:n])
+        q_target = np.asarray(struct.unpack_from(f"<{_N_JOINT_SLOTS}f", f, OFF_TARGET_Q)[:n])
         tcp = np.asarray(struct.unpack_from("<6f", f, OFF_ACTUAL_TCP))
         sm = f[OFF_STATE_MODE]
         return RtSample(
@@ -143,6 +158,7 @@ class XArmRealTime:
             q=q,
             qd=qd,
             tau=tau,
+            q_target=q_target,
             tcp_xyz=tcp[:3] / 1000.0,
             tcp_rotvec=tcp[3:],
             gripper_pos_mm=float(struct.unpack_from(">h", f, OFF_GRIPPER_POS)[0]),

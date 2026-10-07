@@ -29,6 +29,15 @@ from remoroo_lc.constants import DTYPE
 #: The SDK's gripper position range, in its own integer units.
 _GRIPPER_OPEN = 850
 _GRIPPER_CLOSED = 0
+#: The jaw's speed register (POS_SPD, r/min): xarm-python-sdk 1.18.4
+#: core/config/x_config.py:469 (XCONF.ServoConf.POS_SPD = 0x0303) -- the register
+#: set_gripper_position(speed=...) writes through gripper_modbus_set_posspd
+#: (core/wrapper/uxbus_cmd.py:939-941).
+_GRIPPER_REG_SPEED = 0x0303
+#: Top of the jaw's speed range, r/min.  The 1.18.4 SDK states none in code;
+#: xarm_ros gives 1..5000 (remoroo_sysid/docs/research/gripper_software.md:48,
+#: [ROS1]).  OPERATOR TO CONFIRM (sysid D4, 2026-10-07).
+_GRIPPER_SPEED_MAX = 5000
 
 #: servo_j wants targets at a steady cadence; falling behind faults the
 #: controller rather than merely lagging.
@@ -140,6 +149,21 @@ class XArmUnit(RobotAdapter):
         # 0 = open, 1 = closed in this package; the SDK is the other way round.
         pos = int(round(_GRIPPER_OPEN + frac * (_GRIPPER_CLOSED - _GRIPPER_OPEN)))
         arm.set_gripper_position(pos, wait=False)
+
+    def gripper_speed(self) -> float:
+        """The jaw's CONFIGURED speed, r/min, read off its speed register over
+        the tool Modbus: the speed it moves at when nobody passes one, which is
+        how deployment drives it (remoroo-world deploy/edge_student/
+        commanderd.py:397).  The SDK only caches what IT last wrote
+        (gripper_speed = 0 after connect, x3/base.py:208), so its cache would
+        answer 0."""
+        arm = self._require()
+        ret = arm.arm_cmd.gripper_modbus_r16s(_GRIPPER_REG_SPEED, 1)
+        # the SDK's own one-register reply framing (gripper_modbus_get_errcode,
+        # uxbus_cmd.py:943-954): code first, the value big-endian at bytes 5:7
+        if ret[0] != 0 or len(ret) != 7:
+            raise RuntimeError(f"{self.name}: jaw speed register read returned {ret}")
+        return float((int(ret[5]) << 8) | int(ret[6]))
 
     def limits(self) -> UnitLimits:
         arm = self._require()

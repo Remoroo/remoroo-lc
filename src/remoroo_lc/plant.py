@@ -70,6 +70,11 @@ class Plant:
         self.qd = np.zeros(self.n, dtype=DTYPE)
         self._queue: list[np.ndarray] = []
         self.last_substeps: tuple[np.ndarray, np.ndarray] | None = None
+        #: The delayed target the last step() actually drove the joints toward --
+        #: this plant's stand-in for the controller's TARGET_Q (port-30000 offset
+        #: 32), so a raw sysid record off the mock carries the same send ->
+        #: accepted-target split a real one does.
+        self.last_applied: np.ndarray | None = None
 
     # ------------------------------------------------------------------ #
     def reset(self, q: np.ndarray, qd: np.ndarray | None = None) -> None:
@@ -99,6 +104,7 @@ class Plant:
             applied = self._queue.pop(0)
         else:
             applied = target
+        self.last_applied = applied.copy()
         trace_q = [] if record else None
         trace_qd = [] if record else None
         for _ in range(self.substeps):
@@ -189,3 +195,35 @@ class Plant:
     def damping_ratio(self) -> np.ndarray:
         """kd / (2 sqrt(kp M)) per joint."""
         return (self.kd / (DTYPE(2.0) * np.sqrt(self.kp * self.inertia))).astype(DTYPE)
+
+
+class GripperPlant:
+    """A jaw that moves toward its commanded position at a speed-proportional
+    RATE, after a pure command DELAY -- the stand-in scripts/sysid_tapes.py
+    --gripper is dry-run against, so its fit is checked against a jaw whose
+    delay and rate are known before it is trusted with the real one.
+
+        pos(t) moves toward cmd(t - delay_s) at rate_per_speed * speed units/s
+
+    Units are the caller's (the xArm SDK's 0..850 integer scale on the rig).
+    The parameters are whatever the TEST says they are: there is no measured
+    jaw to default to, which is the point of the session this mocks.
+    """
+
+    def __init__(self, delay_s: float, rate_per_speed: float, pos0: float) -> None:
+        self.delay_s = float(delay_s)
+        self.rate_per_speed = float(rate_per_speed)
+        self.pos = float(pos0)
+        self._cmds: list[tuple[float, float, float]] = []   # (t, pos, speed)
+
+    def command(self, t: float, pos: float, speed: float) -> None:
+        self._cmds.append((float(t), float(pos), float(speed)))
+
+    def advance(self, t: float, dt: float) -> float:
+        """Integrate from t - dt to t; returns the position at t."""
+        live = [c for c in self._cmds if c[0] + self.delay_s <= t]
+        if live:
+            _, target, speed = live[-1]
+            step = self.rate_per_speed * speed * dt
+            self.pos += float(np.clip(target - self.pos, -step, step))
+        return self.pos
