@@ -481,3 +481,27 @@ def test_the_old_self_check_path_is_unchanged():
     m = _sysid()
     assert m.MAX_DELAY_TICKS == 12
     assert m.main([str(ROOT / "configs" / "cells" / "single_6dof_leg.yaml")]) == 0
+
+
+def test_gripper_speed_reads_the_inner_arm_command_channel():
+    """The jaw's configured speed is read through the SDK wrapper's INNER arm
+    (XArmAPI._arm.arm_cmd, SDK 1.18.4 xarm_api.py:86 / x3/base.py:1008); the
+    wrapper itself has no `arm_cmd` and raises AttributeError for it -- which a
+    __getattr__-everything fake hid until first hardware contact (2026-10-07).
+    The reply below is the one the real arm-1 controller returned that day."""
+    import types
+
+    from remoroo_lc.adapters.xarm import XArmUnit
+
+    class Wrapper:                      # the real XArmAPI's attribute behaviour
+        def __init__(self):
+            cmd = types.SimpleNamespace(
+                gripper_modbus_r16s=lambda addr, count: [0, 9, 8, 3, 2, 19, 136])
+            self._arm = types.SimpleNamespace(arm_cmd=cmd)
+
+        def __getattr__(self, item):
+            raise AttributeError(f"'XArmAPI' has not attribute '{item}'")
+
+    u = XArmUnit("cell", "arm-a", 6, 250.0)
+    u._arm = Wrapper()
+    assert u.gripper_speed() == 5000.0

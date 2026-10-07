@@ -158,7 +158,11 @@ class XArmUnit(RobotAdapter):
         (gripper_speed = 0 after connect, x3/base.py:208), so its cache would
         answer 0."""
         arm = self._require()
-        ret = arm.arm_cmd.gripper_modbus_r16s(_GRIPPER_REG_SPEED, 1)
+        # the command channel lives on the wrapper's INNER arm (SDK 1.18.4:
+        # XArmAPI._arm = XArm(...), xarm_api.py:86; XArm.arm_cmd, x3/base.py:1008);
+        # XArmAPI itself raises AttributeError for `arm_cmd` (first hardware
+        # contact, 2026-10-07: reply [0, 9, 8, 3, 2, 19, 136] -> 5000 r/min).
+        ret = arm._arm.arm_cmd.gripper_modbus_r16s(_GRIPPER_REG_SPEED, 1)
         # the SDK's own one-register reply framing (gripper_modbus_get_errcode,
         # uxbus_cmd.py:943-954): code first, the value big-endian at bytes 5:7
         if ret[0] != 0 or len(ret) != 7:
